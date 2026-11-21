@@ -1,0 +1,72 @@
+# Local streaming stack: one Redpanda broker, its web console, and the topics
+# Detektive uses. Start with `docker compose up -d`, stop with
+# `docker compose down` (add `-v` to also delete the stored messages).
+#
+#   Kafka API for programs on your machine:  localhost:19092
+#   Redpanda Console:                         http://localhost:8080
+
+name: detektive
+
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.14
+    container_name: detektive-redpanda
+    command:
+      - redpanda
+      - start
+      # one listener for containers on this network, one for your machine
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      # development settings: relaxed fsync, small footprint, one core
+      - --mode dev-container
+      - --smp 1
+      - --memory 1G
+      - --default-log-level=info
+    ports:
+      - "19092:19092"
+      - "19644:9644" # admin API
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+
+  # Creates the topics once Redpanda is healthy, then exits.
+  # payments: 3 partitions, keyed by sender account, so one sender's payments
+  # stay in order while the stream can still be spread across consumers.
+  topics:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.14
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        rpk topic create payments --partitions 3 -X brokers=redpanda:9092 || true
+        rpk topic create payments-dead-letter --partitions 1 -X brokers=redpanda:9092 || true
+        rpk topic list -X brokers=redpanda:9092
+    restart: "no"
+
+  console:
+    image: docker.redpanda.com/redpandadata/console:v3.10.0
+    container_name: detektive-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml && /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:9092"]
+    ports:
+      - "8080:8080"
+
+volumes:
+  redpanda-data:
