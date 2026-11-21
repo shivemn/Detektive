@@ -45,9 +45,15 @@ together, which comes with the graph engine's checkpoints.
 
 With three partitions, events arrive interleaved: a later payment from one
 partition can be read before an earlier one from another. The consumer counts
-these (`out_of_order`) and never moves its clock backwards. The graph engine
-will use event time with a lateness allowance, not arrival order, for exactly
-this reason.
+these (`out_of_order`) and never moves its clock backwards.
+
+On real Redpanda this is not a corner case. Replaying the first 100,000
+HI-Small transactions through the 3-partition topic, **65,940 (66%) arrived
+after an event with a later timestamp**. The consumer reads each partition
+in bursts, so whole batches from one partition land before the next. The
+graph engine must therefore window on event time with a lateness allowance
+and a watermark, never on arrival order. How large that allowance must be is
+the next thing to measure.
 
 ## Testing without a broker
 
@@ -71,6 +77,16 @@ Two things the mock cluster taught us:
 
 ## Numbers so far
 
-On the mock cluster (2-core cloud VM, release build): the replayer publishes
-about 360,000 events per second including the final flush. Consumer
-throughput against real Redpanda gets measured in week 4, with metrics.
+| Where | What | Result |
+| --- | --- | --- |
+| Real Redpanda, local Docker (WSL) | 100,000 HI-Small events, replay then consume | All 100,000 processed, 0 duplicates, 0 bad, 105,585 distinct accounts |
+| Mock cluster, 2-core cloud VM, release build | Replayer publishing, including the final flush | about 360,000 events/s |
+| Mock cluster, same machine | Consumer, first to last message | about 600,000 events/s |
+
+Consumer throughput and lag against real Redpanda get measured properly in
+week 4, with Prometheus metrics.
+
+The idle stop (`--idle-secs`) counts only while the consumer owns
+partitions, so a slow group join does not end a run before it starts, and
+progress lines report the rate since the previous line rather than a
+running average.
