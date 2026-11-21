@@ -10,9 +10,10 @@ arrives. Every alert says which pattern it matched and why.
 The engine will be written in Rust. Models are trained in Python and served
 from Rust through ONNX.
 
-> **Status: week 2 of about 24.** What exists today is the data pipeline, the
-> evaluation protocol, a floor baseline and a Rust replayer that streams the
-> data in time order. There is no graph engine yet.
+> **Status: week 3 of about 24.** What exists today is the data pipeline, the
+> evaluation protocol, a floor baseline, a Rust replayer that streams the data
+> in time order, and a consumer service reading that stream from Redpanda.
+> There is no graph engine yet.
 
 ## Data
 
@@ -48,9 +49,17 @@ about 2.7 million events per second, in exactly the order the Python loader
 uses. Laundering labels are kept off the stream. Details and design notes:
 [docs/replayer.md](docs/replayer.md).
 
+The replayer publishes to Redpanda, and `crates/consumer` reads it with
+at-least-once delivery: offsets are stored only after a message is handled,
+undecodable messages go to a dead-letter topic with the reason attached, and
+repeats are skipped by transaction id. The end-to-end tests run the real
+Kafka clients against librdkafka's mock cluster, so they need no Docker.
+Delivery guarantees and how to run it: [docs/streaming.md](docs/streaming.md).
+
 ## Running it
 
-Python needs 3.10+; Rust needs a stable toolchain (`rustup`).
+Python needs 3.10+; Rust needs a stable toolchain (`rustup`). The Redpanda
+parts need Docker and, on Windows, WSL (see [docs/streaming.md](docs/streaming.md)).
 
 ```bash
 cd ml
@@ -65,8 +74,12 @@ python -m detektive_ml.baselines.raw_xgb data/processed/hi_small.parquet
 ```
 
 ```bash
-cargo test
+cargo test --workspace --all-features
 cargo run --release -p detektive-replay -- data/raw/HI-Small_Trans.csv --speed 100 --limit 20 --india
+
+docker compose up -d
+cargo run --release -p detektive-replay --features kafka -- data/raw/HI-Small_Trans.csv --out kafka --limit 100000
+cargo run --release -p detektive-consumer -- --idle-secs 10
 ```
 
 No dataset yet? `python -m detektive_ml.synthetic sample.csv` writes a small
@@ -75,7 +88,7 @@ fake file in the same format, good enough to check the pipeline runs.
 ## Layout
 
 ```
-crates/    Rust: replay (the payment stream)
+crates/    Rust: replay (the payment stream), consumer (reads it from Redpanda)
 ml/        Python: data loading, time split, evaluation, baselines
 docs/      design notes and the evaluation protocol
 data/      datasets (not committed)
