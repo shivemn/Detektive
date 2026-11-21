@@ -1,0 +1,26 @@
+# datasets stay out of git (download them, see data/README.md)
+data/raw/
+data/processed/
+*.parquet
+*.csv
+!ml/tests/fixtures/*.csv
+
+# experiment output
+results/*.json
+!results/.gitkeep
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# rust
+target/
+
+# editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
