@@ -5,6 +5,7 @@ on:
     paths: ["ml/**", ".github/workflows/ml.yml"]
   pull_request:
     paths: ["ml/**", ".github/workflows/ml.yml"]
+  workflow_dispatch:
 
 jobs:
   test:
