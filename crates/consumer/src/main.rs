@@ -61,14 +61,14 @@ async fn main() -> Result<()> {
     };
     let summary = run(cfg, shutdown).await?;
     eprintln!(
-        "processed {} | duplicates {} | bad {} (dead-lettered {}) | out of order {} | accounts {} | {:.1}s, {:.0} msgs/s",
+        "processed {} | duplicates {} | bad {} (dead-lettered {}) | out of order {} | accounts {} | {:.2}s busy, {:.0} msgs/s",
         summary.processed,
         summary.duplicates,
         summary.bad,
         summary.dead_lettered,
         summary.out_of_order,
         summary.accounts,
-        summary.elapsed.as_secs_f64(),
+        summary.busy.as_secs_f64(),
         summary.per_second()
     );
     Ok(())

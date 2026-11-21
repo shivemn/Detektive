@@ -70,9 +70,9 @@ async fn events_through_the_mock_cluster() {
     // everything the broker still holds must arrive, once
     assert_eq!(summary.processed, retained);
     eprintln!(
-        "consumed {} in {:.2}s ({:.0}/s, including group join)",
+        "consumed {} in {:.2}s ({:.0}/s, first to last message)",
         summary.processed,
-        summary.elapsed.as_secs_f64(),
+        summary.busy.as_secs_f64(),
         summary.per_second()
     );
 }

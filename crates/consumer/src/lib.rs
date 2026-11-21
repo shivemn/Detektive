@@ -50,13 +50,15 @@ pub struct Summary {
     pub dead_lettered: u64,
     pub out_of_order: u64,
     pub accounts: usize,
-    pub elapsed: Duration,
+    /// From the first message to the last: the time spent actually consuming,
+    /// without the group join before it or the idle wait after it.
+    pub busy: Duration,
 }
 
 impl Summary {
     pub fn per_second(&self) -> f64 {
         let handled = self.processed + self.duplicates + self.bad;
-        handled as f64 / self.elapsed.as_secs_f64().max(f64::EPSILON)
+        handled as f64 / self.busy.as_secs_f64().max(f64::EPSILON)
     }
 }
 
@@ -92,22 +94,24 @@ pub async fn run(cfg: Config, shutdown: impl Future<Output = ()>) -> Result<Summ
     info!(topic = %cfg.topic, group = %cfg.group, "consuming");
     let mut state = State::new();
     let mut dead_lettered = 0u64;
-    let started = Instant::now();
+    let mut progress = Progress::new();
+    let mut first_message: Option<Instant> = None;
+    let mut last_message = Instant::now();
     let mut report = tokio::time::interval(cfg.report_every);
     report.tick().await; // the first tick fires at once; skip it
     tokio::pin!(shutdown);
 
     loop {
-        if cfg
-            .stop_after
-            .is_some_and(|n| state.processed + state.duplicates + state.bad >= n)
-        {
+        if cfg.stop_after.is_some_and(|n| state.handled() >= n) {
             break;
         }
-        let next = async {
+        // The idle deadline is its own timer, measured from the last message.
+        // (Wrapping `recv` in a timeout instead would restart the timer every
+        // time a progress report interrupted the wait, so it never fired.)
+        let idle = async {
             match cfg.idle_timeout {
-                Some(idle) => tokio::time::timeout(idle, consumer.recv()).await.ok(),
-                None => Some(consumer.recv().await),
+                Some(limit) => tokio::time::sleep_until((last_message + limit).into()).await,
+                None => std::future::pending().await,
             }
         };
         tokio::select! {
@@ -115,13 +119,21 @@ pub async fn run(cfg: Config, shutdown: impl Future<Output = ()>) -> Result<Summ
                 info!("shutdown requested");
                 break;
             }
-            _ = report.tick() => log_progress(&state, started),
-            received = next => {
-                let Some(received) = received else {
-                    info!("no messages for {:?}, stopping", cfg.idle_timeout.unwrap_or_default());
-                    break;
-                };
+            _ = idle => {
+                // still waiting to be given partitions (joining the group) is
+                // not idleness: restart the clock and keep waiting
+                if consumer.assignment().map_or(true, |a| a.count() == 0) {
+                    last_message = Instant::now();
+                    continue;
+                }
+                info!("no messages for {:?}, stopping", cfg.idle_timeout.unwrap_or_default());
+                break;
+            }
+            _ = report.tick() => progress.log(&state),
+            received = consumer.recv() => {
                 let message = received.context("receiving")?;
+                last_message = Instant::now();
+                first_message.get_or_insert(last_message);
                 if let Outcome::Bad(reason) = state.handle(message.payload()) {
                     let reason = reason.to_string();
                     match (&dead_letters, &cfg.dead_letter_topic) {
@@ -145,7 +157,7 @@ pub async fn run(cfg: Config, shutdown: impl Future<Output = ()>) -> Result<Summ
     // leave the group now, so its partitions move to another member at once
     // instead of after this one's session times out
     consumer.unsubscribe();
-    log_progress(&state, started);
+    progress.log(&state);
 
     Ok(Summary {
         processed: state.processed,
@@ -154,7 +166,9 @@ pub async fn run(cfg: Config, shutdown: impl Future<Output = ()>) -> Result<Summ
         dead_lettered,
         out_of_order: state.out_of_order,
         accounts: state.accounts(),
-        elapsed: started.elapsed(),
+        busy: first_message
+            .map(|first| last_message - first)
+            .unwrap_or_default(),
     })
 }
 
@@ -202,18 +216,35 @@ async fn dead_letter(
     Ok(())
 }
 
-fn log_progress(state: &State, started: Instant) {
-    let handled = state.processed + state.duplicates + state.bad;
-    info!(
-        processed = state.processed,
-        duplicates = state.duplicates,
-        bad = state.bad,
-        out_of_order = state.out_of_order,
-        accounts = state.accounts(),
-        rate = format!(
-            "{:.0}/s",
-            handled as f64 / started.elapsed().as_secs_f64().max(f64::EPSILON)
-        ),
-        "progress"
-    );
+/// Logs counts and the rate since the previous report, so a quiet stream
+/// shows 0/s instead of a slowly falling average.
+struct Progress {
+    last_handled: u64,
+    last_at: Instant,
+}
+
+impl Progress {
+    fn new() -> Self {
+        Self {
+            last_handled: 0,
+            last_at: Instant::now(),
+        }
+    }
+
+    fn log(&mut self, state: &State) {
+        let handled = state.handled();
+        let secs = self.last_at.elapsed().as_secs_f64().max(f64::EPSILON);
+        let rate = (handled - self.last_handled) as f64 / secs;
+        self.last_handled = handled;
+        self.last_at = Instant::now();
+        info!(
+            processed = state.processed,
+            duplicates = state.duplicates,
+            bad = state.bad,
+            out_of_order = state.out_of_order,
+            accounts = state.accounts(),
+            rate = format!("{rate:.0}/s"),
+            "progress"
+        );
+    }
 }

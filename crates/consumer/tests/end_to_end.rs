@@ -221,3 +221,22 @@ async fn several_partitions_deliver_events_out_of_time_order() {
     // reason the graph engine will need event-time windows, not arrival order
     assert!(summary.out_of_order > 0, "{summary:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stops_when_idle_even_with_frequent_progress_reports() {
+    // regression: reports every 1 s used to restart a 3 s idle timer forever
+    let (_cluster, brokers) = cluster();
+    publish(&brokers, &transactions(100));
+
+    let cfg = Config {
+        idle_timeout: Some(Duration::from_secs(3)),
+        report_every: Duration::from_secs(1),
+        ..config(&brokers, "idle")
+    };
+    let summary = tokio::time::timeout(Duration::from_secs(30), consume(cfg))
+        .await
+        .expect("consumer never stopped after going idle");
+    assert_eq!(summary.processed, 100);
+    // busy time covers only the messages, not the join or the idle wait
+    assert!(summary.busy < Duration::from_secs(2), "{summary:?}");
+}

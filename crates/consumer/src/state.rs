@@ -67,6 +67,11 @@ impl State {
         Outcome::Processed
     }
 
+    /// Every message looked at, whatever its outcome.
+    pub fn handled(&self) -> u64 {
+        self.processed + self.duplicates + self.bad
+    }
+
     pub fn accounts(&self) -> usize {
         self.seen_accounts.len()
     }
