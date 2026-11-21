@@ -14,7 +14,8 @@ cargo run --release -p detektive-replay -- data/raw/HI-Small_Trans.csv --speed 1
 | `--speed 1` | Real time: a minute in the data is a minute of waiting |
 | `--speed 100` | 100× faster than real time |
 | `--limit N` | Stop after N events |
-| `--out PATH` | Write to a file; `-` is stdout (default), `none` discards |
+| `--out PATH` | Write to a file; `-` is stdout (default), `none` discards, `kafka` publishes to Redpanda |
+| `--brokers`, `--topic` | Where `--out kafka` publishes (default `localhost:19092`, `payments`) |
 | `--india` | Add UPI-style ids, INR amounts and IST times |
 | `--with-labels` | Include `is_laundering` (off by default) |
 
@@ -36,8 +37,11 @@ If the engine could see `is_laundering`, a bug could quietly let it cheat.
 Evaluation joins labels back on by `tx_id` instead. `--with-labels` exists
 for debugging and checks like the one above.
 
-**Output behind a trait.** The replay loop only knows the `Sink` trait. Week 3
-adds a Redpanda sink without touching the loop.
+**Output behind a trait.** The replay loop only knows the `Sink` trait. The
+Redpanda sink (`kafka.rs`, week 3) was added without touching the loop. It
+sits behind the `kafka` cargo feature, so the replayer still builds on plain
+Windows, where librdkafka is hard to compile. See
+[streaming.md](streaming.md).
 
 **Pacing is a pure function.** `Pacer::delay` computes how long to wait from
 the event offset and the time already elapsed, so it is tested without
@@ -75,6 +79,7 @@ In the order data flows, with the Rust ideas each file leans on:
 | `event.rs` | The JSON shape of an event | `serde` derive, `Option` with `then`, `&'static str` for fixed strings |
 | `sink.rs` | Where events go | traits, generics (`JsonLines<W: Write>`), trait objects (`Box<dyn Sink>`) |
 | `lib.rs` | The replay loop | slices, `&mut dyn Trait` |
+| `kafka.rs` | Publishes events to Redpanda | `#[cfg(feature)]`, implementing a library's trait (`ProducerContext`), atomics, `Arc` |
 | `main.rs` | Command-line flags | `clap` derive |
 
 Every file ends with its tests (`#[cfg(test)] mod tests`). Run them with

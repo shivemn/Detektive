@@ -26,9 +26,18 @@ struct Args {
     #[arg(long)]
     limit: Option<usize>,
 
-    /// Where to write events: a file path, "-" for stdout, or "none" to discard
+    /// Where to write events: a file path, "-" for stdout, "none" to discard,
+    /// or "kafka" to publish to Redpanda (needs the `kafka` feature)
     #[arg(long, default_value = "-")]
     out: String,
+
+    /// Redpanda/Kafka bootstrap servers, used with --out kafka
+    #[arg(long, default_value = "localhost:19092")]
+    brokers: String,
+
+    /// Topic to publish to, used with --out kafka
+    #[arg(long, default_value = "payments")]
+    topic: String,
 
     /// Add UPI-style ids, INR amounts and IST times to each event
     #[arg(long)]
@@ -37,6 +46,18 @@ struct Args {
     /// Include the laundering label (off by default: a live stream has none)
     #[arg(long)]
     with_labels: bool,
+}
+
+#[cfg(feature = "kafka")]
+fn kafka_sink(brokers: &str, topic: &str) -> Result<Box<dyn Sink>> {
+    Ok(Box::new(detektive_replay::kafka::KafkaSink::new(
+        brokers, topic,
+    )?))
+}
+
+#[cfg(not(feature = "kafka"))]
+fn kafka_sink(_brokers: &str, _topic: &str) -> Result<Box<dyn Sink>> {
+    anyhow::bail!("this build has no Kafka support; rebuild with `--features kafka`")
 }
 
 fn main() -> Result<()> {
@@ -54,6 +75,7 @@ fn main() -> Result<()> {
     let mut sink: Box<dyn Sink> = match args.out.as_str() {
         "-" => Box::new(JsonLines::new(io::stdout().lock())),
         "none" => Box::new(Discard),
+        "kafka" => kafka_sink(&args.brokers, &args.topic)?,
         path => Box::new(JsonLines::new(
             File::create(path).with_context(|| format!("creating {path}"))?,
         )),

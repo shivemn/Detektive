@@ -3,11 +3,14 @@
 //! The pieces, in the order data flows through them:
 //! `load` reads and sorts the CSV, `accounts` gives every account a small id,
 //! `pace` decides when each event is due, `event` shapes what is sent, and
-//! `sink` decides where it goes.
+//! `sink` decides where it goes (`kafka` adds Redpanda, behind the `kafka`
+//! feature).
 
 pub mod accounts;
 pub mod event;
 pub mod india;
+#[cfg(feature = "kafka")]
+pub mod kafka;
 pub mod load;
 pub mod model;
 pub mod pace;
