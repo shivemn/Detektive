@@ -10,8 +10,9 @@ arrives. Every alert says which pattern it matched and why.
 The engine will be written in Rust. Models are trained in Python and served
 from Rust through ONNX.
 
-> **Status: week 1 of about 24.** What exists today is the data pipeline, the
-> evaluation protocol and a floor baseline. There is no graph engine yet.
+> **Status: week 2 of about 24.** What exists today is the data pipeline, the
+> evaluation protocol, a floor baseline and a Rust replayer that streams the
+> data in time order. There is no graph engine yet.
 
 ## Data
 
@@ -39,9 +40,17 @@ mostly laundering and easy to catch; including them nearly doubles every
 score. Why, and what else the data looks like:
 [docs/data-notes-hi-small.md](docs/data-notes-hi-small.md).
 
+## The stream
+
+`crates/replay` replays the transactions in time order, at real time, 100× or
+full speed. On HI-Small it loads and sorts 5,078,345 rows in 3.9 s and writes
+about 2.7 million events per second, in exactly the order the Python loader
+uses. Laundering labels are kept off the stream. Details and design notes:
+[docs/replayer.md](docs/replayer.md).
+
 ## Running it
 
-Needs Python 3.10+.
+Python needs 3.10+; Rust needs a stable toolchain (`rustup`).
 
 ```bash
 cd ml
@@ -55,12 +64,18 @@ python -m detektive_ml.explore data/processed/hi_small.parquet --patterns data/r
 python -m detektive_ml.baselines.raw_xgb data/processed/hi_small.parquet
 ```
 
+```bash
+cargo test
+cargo run --release -p detektive-replay -- data/raw/HI-Small_Trans.csv --speed 100 --limit 20 --india
+```
+
 No dataset yet? `python -m detektive_ml.synthetic sample.csv` writes a small
 fake file in the same format, good enough to check the pipeline runs.
 
 ## Layout
 
 ```
+crates/    Rust: replay (the payment stream)
 ml/        Python: data loading, time split, evaluation, baselines
 docs/      design notes and the evaluation protocol
 data/      datasets (not committed)
