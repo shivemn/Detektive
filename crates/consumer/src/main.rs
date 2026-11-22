@@ -1,9 +1,11 @@
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+use detektive_consumer::metrics::{self, Metrics};
 use detektive_consumer::{Config, run};
 
 /// Consume the payments stream from Redpanda and keep running counts.
@@ -36,6 +38,10 @@ struct Args {
     /// Seconds between progress lines
     #[arg(long, default_value_t = 5)]
     report_secs: u64,
+
+    /// Address for Prometheus to scrape /metrics from ("none" to turn off)
+    #[arg(long, default_value = "0.0.0.0:9898")]
+    metrics_addr: String,
 }
 
 #[tokio::main]
@@ -56,17 +62,27 @@ async fn main() -> Result<()> {
         idle_timeout: args.idle_secs.map(Duration::from_secs),
         report_every: Duration::from_secs(args.report_secs),
     };
+    let metrics = Arc::new(Metrics::new()?);
+    if args.metrics_addr != "none" {
+        let listener = tokio::net::TcpListener::bind(&args.metrics_addr)
+            .await
+            .with_context(|| format!("binding metrics server to {}", args.metrics_addr))?;
+        tracing::info!(addr = %listener.local_addr()?, "serving /metrics and /health");
+        tokio::spawn(metrics::serve(listener, metrics.clone()));
+    }
+
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
     };
-    let summary = run(cfg, shutdown).await?;
+    let summary = run(cfg, metrics, shutdown).await?;
     eprintln!(
-        "processed {} | duplicates {} | bad {} (dead-lettered {}) | out of order {} | accounts {} | {:.2}s busy, {:.0} msgs/s",
+        "processed {} | duplicates {} | bad {} (dead-lettered {}) | out of order {} (latest by {}s of event time) | accounts {} | {:.2}s busy, {:.0} msgs/s",
         summary.processed,
         summary.duplicates,
         summary.bad,
         summary.dead_lettered,
         summary.out_of_order,
+        summary.max_lateness,
         summary.accounts,
         summary.busy.as_secs_f64(),
         summary.per_second()

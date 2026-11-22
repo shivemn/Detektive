@@ -13,19 +13,22 @@
 
 pub mod bitset;
 pub mod event;
+pub mod metrics;
 pub mod state;
 
 use std::future::Future;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
-use rdkafka::message::{BorrowedMessage, Header, Message, OwnedHeaders};
+use rdkafka::message::{BorrowedMessage, Header, Message, OwnedHeaders, Timestamp};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use tracing::{info, warn};
 
+use crate::metrics::{Metrics, MetricsContext};
 use crate::state::{Outcome, State};
 
 #[derive(Debug, Clone)]
@@ -49,6 +52,8 @@ pub struct Summary {
     pub bad: u64,
     pub dead_lettered: u64,
     pub out_of_order: u64,
+    /// Largest event-time lateness seen, in seconds.
+    pub max_lateness: i64,
     pub accounts: usize,
     /// From the first message to the last: the time spent actually consuming,
     /// without the group join before it or the idle wait after it.
@@ -63,9 +68,13 @@ impl Summary {
 }
 
 /// Run until `shutdown` resolves, `stop_after` messages are handled, or the
-/// stream is idle for `idle_timeout`.
-pub async fn run(cfg: Config, shutdown: impl Future<Output = ()>) -> Result<Summary> {
-    let consumer: StreamConsumer = ClientConfig::new()
+/// stream is idle for `idle_timeout`. Updates `metrics` as it goes.
+pub async fn run(
+    cfg: Config,
+    metrics: Arc<Metrics>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<Summary> {
+    let consumer: StreamConsumer<MetricsContext> = ClientConfig::new()
         .set("bootstrap.servers", &cfg.brokers)
         .set("group.id", &cfg.group)
         .set("auto.offset.reset", "earliest")
@@ -76,7 +85,11 @@ pub async fn run(cfg: Config, shutdown: impl Future<Output = ()>) -> Result<Summ
         // (default 45 s); heartbeats must come at least 3 times per session
         .set("session.timeout.ms", "6000")
         .set("heartbeat.interval.ms", "2000")
-        .create()
+        // librdkafka reports per-partition lag (and more) every 5 s
+        .set("statistics.interval.ms", "5000")
+        .create_with_context(MetricsContext {
+            metrics: metrics.clone(),
+        })
         .with_context(|| format!("connecting consumer to {}", cfg.brokers))?;
     consumer.subscribe(&[&cfg.topic]).context("subscribing")?;
 
@@ -134,16 +147,35 @@ pub async fn run(cfg: Config, shutdown: impl Future<Output = ()>) -> Result<Summ
                 let message = received.context("receiving")?;
                 last_message = Instant::now();
                 first_message.get_or_insert(last_message);
-                if let Outcome::Bad(reason) = state.handle(message.payload()) {
-                    let reason = reason.to_string();
-                    match (&dead_letters, &cfg.dead_letter_topic) {
-                        (Some(producer), Some(topic)) => {
-                            dead_letter(producer, topic, &message, &reason).await?;
-                            dead_lettered += 1;
+                if let Some(latency) = end_to_end_latency(message.timestamp()) {
+                    metrics.end_to_end_latency.observe(latency);
+                }
+                let outcome = state.handle(message.payload());
+                metrics.handle_time.observe(last_message.elapsed().as_secs_f64());
+                match outcome {
+                    Outcome::Processed { lateness } => {
+                        metrics.messages.with_label_values(&["processed"]).inc();
+                        metrics.event_lateness.observe(lateness as f64);
+                        if lateness > 0 {
+                            metrics.out_of_order.inc();
                         }
-                        _ => warn!(partition = message.partition(), offset = message.offset(), %reason, "skipping bad message"),
+                    }
+                    Outcome::Duplicate => metrics.messages.with_label_values(&["duplicate"]).inc(),
+                    Outcome::Bad(reason) => {
+                        metrics.messages.with_label_values(&["bad"]).inc();
+                        let reason = reason.to_string();
+                        match (&dead_letters, &cfg.dead_letter_topic) {
+                            (Some(producer), Some(topic)) => {
+                                dead_letter(producer, topic, &message, &reason).await?;
+                                dead_lettered += 1;
+                                metrics.dead_lettered.inc();
+                            }
+                            _ => warn!(partition = message.partition(), offset = message.offset(), %reason, "skipping bad message"),
+                        }
                     }
                 }
+                metrics.accounts.set(state.accounts() as i64);
+                metrics.event_time.set(state.max_ts.unwrap_or_default());
                 consumer.store_offset_from_message(&message).context("storing offset")?;
             }
         }
@@ -165,11 +197,25 @@ pub async fn run(cfg: Config, shutdown: impl Future<Output = ()>) -> Result<Summ
         bad: state.bad,
         dead_lettered,
         out_of_order: state.out_of_order,
+        max_lateness: state.max_lateness,
         accounts: state.accounts(),
         busy: first_message
             .map(|first| last_message - first)
             .unwrap_or_default(),
     })
+}
+
+/// Seconds since the producer wrote the message, from the timestamp it set.
+/// `None` if the message has no create time; clamped at 0 against clock skew.
+fn end_to_end_latency(ts: Timestamp) -> Option<f64> {
+    let Timestamp::CreateTime(created_ms) = ts else {
+        return None;
+    };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    Some((now_ms - created_ms).max(0) as f64 / 1000.0)
 }
 
 /// Copy a bad message to the dead-letter topic, with where it came from and
