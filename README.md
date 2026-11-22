@@ -10,10 +10,10 @@ arrives. Every alert says which pattern it matched and why.
 The engine will be written in Rust. Models are trained in Python and served
 from Rust through ONNX.
 
-> **Status: week 3 of about 24.** What exists today is the data pipeline, the
+> **Status: week 4 of about 24.** What exists today is the data pipeline, the
 > evaluation protocol, a floor baseline, a Rust replayer that streams the data
-> in time order, and a consumer service reading that stream from Redpanda.
-> There is no graph engine yet.
+> in time order, a consumer service reading that stream from Redpanda, and
+> Prometheus metrics with a Grafana dashboard. There is no graph engine yet.
 
 ## Data
 
@@ -56,6 +56,13 @@ repeats are skipped by transaction id. The end-to-end tests run the real
 Kafka clients against librdkafka's mock cluster, so they need no Docker.
 Delivery guarantees and how to run it: [docs/streaming.md](docs/streaming.md).
 
+The consumer exports Prometheus metrics (throughput by outcome, lag per
+partition, end-to-end latency, event-time lateness, handling time) and
+`docker compose up` brings up Prometheus and a provisioned Grafana dashboard
+with them. On a laptop it reads about 150,000 messages per second from
+Redpanda. What each metric means, and why event time and processing time are
+kept apart: [docs/observability.md](docs/observability.md).
+
 ## Running it
 
 Python needs 3.10+; Rust needs a stable toolchain (`rustup`). The Redpanda
@@ -77,9 +84,9 @@ python -m detektive_ml.baselines.raw_xgb data/processed/hi_small.parquet
 cargo test --workspace --all-features
 cargo run --release -p detektive-replay -- data/raw/HI-Small_Trans.csv --speed 100 --limit 20 --india
 
-docker compose up -d
-cargo run --release -p detektive-replay --features kafka -- data/raw/HI-Small_Trans.csv --out kafka --limit 100000
-cargo run --release -p detektive-consumer -- --idle-secs 10
+docker compose up -d --build          # Redpanda, consumer, Prometheus, Grafana
+docker compose run --rm replay --speed 3600
+# dashboard: http://localhost:3000
 ```
 
 No dataset yet? `python -m detektive_ml.synthetic sample.csv` writes a small
@@ -89,6 +96,7 @@ fake file in the same format, good enough to check the pipeline runs.
 
 ```
 crates/    Rust: replay (the payment stream), consumer (reads it from Redpanda)
+observability/  Prometheus config, Grafana provisioning and dashboard
 ml/        Python: data loading, time split, evaluation, baselines
 docs/      design notes and the evaluation protocol
 data/      datasets (not committed)

@@ -80,11 +80,16 @@ Two things the mock cluster taught us:
 | Where | What | Result |
 | --- | --- | --- |
 | Real Redpanda, local Docker (WSL) | 100,000 HI-Small events, replay then consume | All 100,000 processed, 0 duplicates, 0 bad, 105,585 distinct accounts |
+| Real Redpanda, same laptop | 200,000 messages (the same 100,000 sent twice), new consumer group | 100,000 processed, 100,000 duplicates skipped, 1.33 s, about 150,000 messages/s |
 | Mock cluster, 2-core cloud VM, release build | Replayer publishing, including the final flush | about 360,000 events/s |
 | Mock cluster, same machine | Consumer, first to last message | about 600,000 events/s |
 
-Consumer throughput and lag against real Redpanda get measured properly in
-week 4, with Prometheus metrics.
+Throughput, lag and latency are now exported as Prometheus metrics; see
+[observability.md](observability.md).
+
+On Windows, read the dataset from inside WSL (for example `~/detektive-data`),
+not from `/mnt/c/...`: loading HI-Small took 103.6 s from the C: drive
+against about 4 s from a Linux filesystem.
 
 The idle stop (`--idle-secs`) counts only while the consumer owns
 partitions, so a slow group join does not end a run before it starts, and
