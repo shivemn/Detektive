@@ -1,0 +1,24 @@
+# Prometheus scrapes every 5 s. The consumer is reachable two ways:
+# as the `consumer` container (docker compose), or on your machine at
+# host.docker.internal when you run it with `cargo run` instead. Whichever is
+# not running simply shows as down on http://localhost:9090/targets.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: detektive-consumer
+    static_configs:
+      - targets: ["consumer:9898"]
+        labels:
+          runs_in: docker
+      - targets: ["host.docker.internal:9898"]
+        labels:
+          runs_in: host
+
+  # Redpanda's own metrics (produce/fetch rates, partition sizes), for
+  # exploring in Prometheus; the dashboard uses the consumer's metrics.
+  - job_name: redpanda
+    metrics_path: /public_metrics
+    static_configs:
+      - targets: ["redpanda:9644"]
