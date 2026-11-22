@@ -1,0 +1,29 @@
+name: stack
+
+# Builds the image and runs the whole stack (real Redpanda, consumer,
+# Prometheus, Grafana) on a synthetic sample: scripts/smoke.sh.
+on:
+  push:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "compose.yaml"
+      - "observability/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/smoke.sh"
+      - ".github/workflows/stack.yml"
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy
+      - run: KEEP=0 bash scripts/smoke.sh
