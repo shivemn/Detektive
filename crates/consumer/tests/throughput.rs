@@ -5,10 +5,12 @@
 //! per partition, so this uses 250,000 events. Treat the numbers as a
 //! client-side sanity check, not a broker benchmark.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rdkafka::mocking::MockCluster;
 
+use detektive_consumer::metrics::Metrics;
 use detektive_consumer::{Config, run};
 use detektive_replay::event::EventOptions;
 use detektive_replay::kafka::KafkaSink;
@@ -66,7 +68,13 @@ async fn events_through_the_mock_cluster() {
         idle_timeout: Some(Duration::from_secs(15)),
         report_every: Duration::from_secs(600),
     };
-    let summary = run(cfg, std::future::pending()).await.unwrap();
+    let summary = run(
+        cfg,
+        Arc::new(Metrics::new().unwrap()),
+        std::future::pending(),
+    )
+    .await
+    .unwrap();
     // everything the broker still holds must arrive, once
     assert_eq!(summary.processed, retained);
     eprintln!(

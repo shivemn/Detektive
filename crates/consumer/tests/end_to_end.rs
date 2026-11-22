@@ -3,6 +3,7 @@
 //! stand-in, so these run anywhere `cargo test` does, CI included.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rdkafka::config::ClientConfig;
@@ -11,6 +12,7 @@ use rdkafka::message::{Headers, Message};
 use rdkafka::mocking::MockCluster;
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 
+use detektive_consumer::metrics::Metrics;
 use detektive_consumer::{Config, Summary, run};
 use detektive_replay::event::EventOptions;
 use detektive_replay::kafka::KafkaSink;
@@ -77,7 +79,13 @@ fn config(brokers: &str, group: &str) -> Config {
 }
 
 async fn consume(cfg: Config) -> Summary {
-    run(cfg, std::future::pending()).await.unwrap()
+    run(
+        cfg,
+        Arc::new(Metrics::new().unwrap()),
+        std::future::pending(),
+    )
+    .await
+    .unwrap()
 }
 
 fn distinct_accounts(txs: &[Transaction]) -> usize {
@@ -239,4 +247,103 @@ async fn stops_when_idle_even_with_frequent_progress_reports() {
     assert_eq!(summary.processed, 100);
     // busy time covers only the messages, not the join or the idle wait
     assert!(summary.busy < Duration::from_secs(2), "{summary:?}");
+}
+
+/// GET a path from a local HTTP server, the way Prometheus scrapes.
+async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    response.split_once("\r\n\r\n").unwrap().1.to_owned()
+}
+
+fn metric(text: &str, name: &str) -> f64 {
+    text.lines()
+        .find_map(|l| l.strip_prefix(name).and_then(|rest| rest.strip_prefix(' ')))
+        .unwrap_or_else(|| panic!("no {name} in\n{text}"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_endpoint_reports_what_the_consumer_did() {
+    let (_cluster, brokers) = cluster();
+    publish(&brokers, &transactions(500));
+    let producer: BaseProducer = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .create()
+        .unwrap();
+    producer
+        .send(
+            BaseRecord::<[u8], [u8]>::to(TOPIC)
+                .key(&b"k"[..])
+                .payload(&b"broken"[..]),
+        )
+        .unwrap();
+    producer.flush(Duration::from_secs(10)).unwrap();
+
+    let metrics = Arc::new(Metrics::new().unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(detektive_consumer::metrics::serve(
+        listener,
+        metrics.clone(),
+    ));
+    assert_eq!(http_get(addr, "/health").await, "ok");
+
+    // run past one 5 s statistics interval so per-partition lag gets reported
+    let cfg = Config {
+        idle_timeout: Some(Duration::from_secs(7)),
+        ..config(&brokers, "metrics")
+    };
+    let summary = run(cfg, metrics, std::future::pending()).await.unwrap();
+    let text = http_get(addr, "/metrics").await;
+
+    assert_eq!(
+        metric(
+            &text,
+            "detektive_consumer_messages_total{outcome=\"processed\"}"
+        ),
+        500.0
+    );
+    assert_eq!(
+        metric(&text, "detektive_consumer_messages_total{outcome=\"bad\"}"),
+        1.0
+    );
+    assert_eq!(metric(&text, "detektive_consumer_dead_lettered_total"), 1.0);
+    assert_eq!(
+        metric(&text, "detektive_consumer_accounts"),
+        summary.accounts as f64
+    );
+    assert_eq!(
+        metric(&text, "detektive_consumer_out_of_order_total"),
+        summary.out_of_order as f64
+    );
+    assert_eq!(
+        metric(&text, "detektive_consumer_event_lateness_seconds_count"),
+        500.0
+    );
+    assert_eq!(
+        metric(&text, "detektive_consumer_end_to_end_latency_seconds_count"),
+        501.0
+    );
+    assert_eq!(
+        metric(&text, "detektive_consumer_event_time_seconds"),
+        (1_661_990_400 + 499 * 60) as f64
+    );
+    // everything was read, so every partition's lag is 0
+    let lag: Vec<f64> = (0..3)
+        .map(|p| {
+            metric(
+                &text,
+                &format!("detektive_consumer_lag_messages{{partition=\"{p}\"}}"),
+            )
+        })
+        .collect();
+    assert_eq!(lag, vec![0.0, 0.0, 0.0], "{text}");
 }
