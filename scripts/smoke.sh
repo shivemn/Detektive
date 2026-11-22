@@ -9,6 +9,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 ROWS=${ROWS:-20000}
+METRICS_PORT=${METRICS_PORT:-9898}
+PROMETHEUS_PORT=${PROMETHEUS_PORT:-9090}
+GRAFANA_PORT=${GRAFANA_PORT:-3000}
 SAMPLE_DIR=$(mktemp -d)
 GROUP_HINT="consumer group detektive-consumer"
 
@@ -32,21 +35,21 @@ wait_for() {
 }
 
 processed_on_consumer() {
-    curl -fsS localhost:9898/metrics | grep -qx "detektive_consumer_messages_total{outcome=\"processed\"} $ROWS"
+    curl -fsS localhost:$METRICS_PORT/metrics | grep -qx "detektive_consumer_messages_total{outcome=\"processed\"} $ROWS"
 }
 
 processed_in_prometheus() {
-    curl -fsS -G localhost:9090/api/v1/query \
+    curl -fsS -G localhost:$PROMETHEUS_PORT/api/v1/query \
         --data-urlencode 'query=sum(detektive_consumer_messages_total{outcome="processed"})' |
         python3 -c "import json,sys; r=json.load(sys.stdin)['data']['result']; sys.exit(0 if r and float(r[0]['value'][1]) == $ROWS else 1)"
 }
 
 grafana_has_dashboard() {
-    curl -fsS localhost:3000/api/dashboards/uid/detektive-stream | grep -q '"title":"Detektive: payment stream"'
+    curl -fsS localhost:$GRAFANA_PORT/api/dashboards/uid/detektive-stream | grep -q '"title":"Detektive: payment stream"'
 }
 
 grafana_reaches_prometheus() {
-    curl -fsS localhost:3000/api/datasources/uid/prometheus/health | grep -q '"status":"OK"'
+    curl -fsS localhost:$GRAFANA_PORT/api/datasources/uid/prometheus/health | grep -q '"status":"OK"'
 }
 
 log "checking configuration"

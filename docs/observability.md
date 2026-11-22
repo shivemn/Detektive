@@ -23,6 +23,11 @@ only).
 On Windows, keep the dataset inside WSL for speed and point the replayer at
 it: `DETEKTIVE_DATA_DIR=$HOME/detektive-data docker compose run --rm replay`.
 
+If another project already uses one of the ports, pick others:
+`GRAFANA_PORT=3001 PROMETHEUS_PORT=9091 docker compose up -d` (also
+`CONSOLE_PORT` and `METRICS_PORT`; a `.env` file next to `compose.yaml` works
+too). Grafana reaches Prometheus inside Docker's network, so it does not care.
+
 To run the consumer with `cargo run` instead of in Docker, stop the container
 first (`docker compose stop consumer`). Prometheus also scrapes
 `host.docker.internal:9898`, so the dashboard keeps working.

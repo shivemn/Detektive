@@ -19,6 +19,9 @@ __pycache__/
 # rust
 target/
 
+# local settings (e.g. port overrides for docker compose)
+.env
+
 # editors and OS
 .vscode/
 .idea/

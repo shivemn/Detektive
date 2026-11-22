@@ -9,6 +9,12 @@
 #   Prometheus:                               http://localhost:9090
 #   Grafana (dashboard "Detektive"):          http://localhost:3000
 #
+# Another project already on one of those ports? Pick others, on the command
+# line or in a .env file next to this one (kept out of git):
+#   GRAFANA_PORT=3001 PROMETHEUS_PORT=9091 docker compose up -d
+# CONSOLE_PORT and METRICS_PORT work the same way. Kafka's 19092 is fixed,
+# because the broker advertises that address to clients.
+#
 # Feed it with the replayer, here 1 hour of data per second:
 #   docker compose run --rm replay --speed 3600
 
@@ -73,7 +79,7 @@ services:
         kafka:
           brokers: ["redpanda:9092"]
     ports:
-      - "8080:8080"
+      - "${CONSOLE_PORT:-8080}:8080"
 
   # The consumer, built from this repo's Dockerfile.
   consumer:
@@ -85,7 +91,7 @@ services:
         condition: service_completed_successfully
     command: ["--brokers", "redpanda:9092", "--metrics-addr", "0.0.0.0:9898"]
     ports:
-      - "9898:9898"
+      - "${METRICS_PORT:-9898}:9898"
     restart: unless-stopped
 
   # On demand only: `docker compose run --rm replay [flags]`. Reads the data
@@ -111,7 +117,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway" # reach a consumer run with `cargo run`
     ports:
-      - "9090:9090"
+      - "${PROMETHEUS_PORT:-9090}:9090"
 
   grafana:
     image: grafana/grafana:13.2.4
@@ -128,7 +134,7 @@ services:
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     ports:
-      - "3000:3000"
+      - "${GRAFANA_PORT:-3000}:3000"
 
 volumes:
   redpanda-data:
