@@ -39,8 +39,10 @@ struct Args {
     #[arg(long, default_value_t = 5)]
     report_secs: u64,
 
-    /// Address for Prometheus to scrape /metrics from ("none" to turn off)
-    #[arg(long, default_value = "0.0.0.0:9898")]
+    /// Address for Prometheus to scrape /metrics from ("none" to turn off).
+    /// 9899 on your machine; the Docker container uses 9898, so Prometheus
+    /// can tell the two apart.
+    #[arg(long, default_value = "0.0.0.0:9899")]
     metrics_addr: String,
 }
 

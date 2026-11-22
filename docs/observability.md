@@ -29,8 +29,12 @@ If another project already uses one of the ports, pick others:
 too). Grafana reaches Prometheus inside Docker's network, so it does not care.
 
 To run the consumer with `cargo run` instead of in Docker, stop the container
-first (`docker compose stop consumer`). Prometheus also scrapes
-`host.docker.internal:9898`, so the dashboard keeps working.
+first (`docker compose stop consumer`). Run that way, the consumer serves its
+metrics on port 9899, and Prometheus also scrapes `host.docker.internal:9899`,
+so the dashboard keeps working. The port differs from the container's 9898 on
+purpose: the container's port is published on your machine too, so scraping
+`host.docker.internal:9898` would read the same consumer twice and double
+every total on the dashboard (an early version did exactly that).
 
 ## Three kinds of time
 

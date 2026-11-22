@@ -1,7 +1,12 @@
 # Prometheus scrapes every 5 s. The consumer is reachable two ways:
-# as the `consumer` container (docker compose), or on your machine at
-# host.docker.internal when you run it with `cargo run` instead. Whichever is
-# not running simply shows as down on http://localhost:9090/targets.
+# as the `consumer` container (docker compose, port 9898), or on your machine
+# at host.docker.internal when you run it with `cargo run` instead (port 9899).
+# Whichever is not running simply shows as down on
+# http://localhost:9090/targets.
+#
+# The two ports must differ. The container's 9898 is also published on the
+# host, so a host target on 9898 would reach the same container a second time,
+# and every sum on the dashboard would count it twice.
 global:
   scrape_interval: 5s
   evaluation_interval: 5s
@@ -12,7 +17,7 @@ scrape_configs:
       - targets: ["consumer:9898"]
         labels:
           runs_in: docker
-      - targets: ["host.docker.internal:9898"]
+      - targets: ["host.docker.internal:9899"]
         labels:
           runs_in: host
 
