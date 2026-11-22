@@ -12,7 +12,11 @@ use crate::event::{DecodeError, decode};
 
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
-    Processed,
+    /// `lateness`: seconds this event's time is behind the newest event seen
+    /// before it (0 when it arrives in order).
+    Processed {
+        lateness: i64,
+    },
     Duplicate,
     Bad(DecodeError),
 }
@@ -29,6 +33,8 @@ pub struct State {
     pub out_of_order: u64,
     /// Largest event time seen (seconds since the epoch).
     pub max_ts: Option<i64>,
+    /// The latest any event arrived, in seconds of event time.
+    pub max_lateness: i64,
     pub by_format: BTreeMap<String, u64>,
 }
 
@@ -53,10 +59,17 @@ impl State {
         self.processed += 1;
         self.seen_accounts.insert(event.src);
         self.seen_accounts.insert(event.dst);
-        match self.max_ts {
-            Some(max) if event.ts < max => self.out_of_order += 1,
-            _ => self.max_ts = Some(event.ts),
-        }
+        let lateness = match self.max_ts {
+            Some(max) if event.ts < max => {
+                self.out_of_order += 1;
+                max - event.ts
+            }
+            _ => {
+                self.max_ts = Some(event.ts);
+                0
+            }
+        };
+        self.max_lateness = self.max_lateness.max(lateness);
         // only allocates the first time a format is seen
         match self.by_format.get_mut(event.format.as_ref()) {
             Some(n) => *n += 1,
@@ -64,7 +77,7 @@ impl State {
                 self.by_format.insert(event.format.into_owned(), 1);
             }
         }
-        Outcome::Processed
+        Outcome::Processed { lateness }
     }
 
     /// Every message looked at, whatever its outcome.
@@ -98,7 +111,7 @@ mod tests {
         ] {
             assert_eq!(
                 s.handle(Some(&event(id, ts, src, dst, fmt))),
-                Outcome::Processed
+                Outcome::Processed { lateness: 0 }
             );
         }
         assert_eq!(s.processed, 3);
@@ -111,7 +124,7 @@ mod tests {
     fn redelivered_events_are_skipped() {
         let mut s = State::new();
         let e = event(9, 10, 1, 2, "ach");
-        assert_eq!(s.handle(Some(&e)), Outcome::Processed);
+        assert_eq!(s.handle(Some(&e)), Outcome::Processed { lateness: 0 });
         assert_eq!(s.handle(Some(&e)), Outcome::Duplicate);
         assert_eq!((s.processed, s.duplicates), (1, 1));
     }
@@ -120,9 +133,17 @@ mod tests {
     fn late_events_are_counted_but_do_not_move_time_back() {
         let mut s = State::new();
         s.handle(Some(&event(0, 100, 1, 2, "ach")));
-        s.handle(Some(&event(1, 50, 1, 2, "ach")));
-        assert_eq!(s.out_of_order, 1);
+        assert_eq!(
+            s.handle(Some(&event(1, 50, 1, 2, "ach"))),
+            Outcome::Processed { lateness: 50 }
+        );
+        assert_eq!(
+            s.handle(Some(&event(2, 90, 1, 2, "ach"))),
+            Outcome::Processed { lateness: 10 }
+        );
+        assert_eq!(s.out_of_order, 2);
         assert_eq!(s.max_ts, Some(100));
+        assert_eq!(s.max_lateness, 50);
     }
 
     #[test]
