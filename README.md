@@ -60,7 +60,10 @@ The consumer exports Prometheus metrics (throughput by outcome, lag per
 partition, end-to-end latency, event-time lateness, handling time) and
 `docker compose up` brings up Prometheus and a provisioned Grafana dashboard
 with them. On a laptop it reads about 150,000 messages per second from
-Redpanda. What each metric means, and why event time and processing time are
+Redpanda. On a full replay of HI-Small, 95.4% of events arrive in event-time
+order and none is more than 2 hours late; a consumer catching up on a backlog
+sees days of disorder, which is why the graph engine will keep a watermark per
+partition. What each metric means, and why event time and processing time are
 kept apart: [docs/observability.md](docs/observability.md).
 
 ## Running it

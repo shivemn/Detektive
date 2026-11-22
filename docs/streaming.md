@@ -52,8 +52,9 @@ HI-Small transactions through the 3-partition topic, **65,940 (66%) arrived
 after an event with a later timestamp**. The consumer reads each partition
 in bursts, so whole batches from one partition land before the next. The
 graph engine must therefore window on event time with a lateness allowance
-and a watermark, never on arrival order. How large that allowance must be is
-the next thing to measure.
+and a watermark, never on arrival order. How late events actually arrive, on
+a full replay and while catching up, is measured in
+[observability.md](observability.md#a-full-run-how-late-do-events-arrive).
 
 ## Testing without a broker
 

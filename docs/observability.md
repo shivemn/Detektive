@@ -111,3 +111,57 @@ The consumer also serves `/health`, which answers `ok`.
   (`.github/workflows/stack.yml`); it also runs locally.
 
 Not covered: how the dashboard looks. Open it and judge.
+
+## A full run: how late do events arrive?
+
+The whole HI-Small file (5,078,345 transactions over 18 days) replayed at
+speed 3600 (one hour of data per second) into the 3-partition topic, with the
+consumer already running. Everything in Docker on a Windows laptop (WSL2),
+fresh volumes.
+
+| | |
+| --- | --- |
+| Replay | 424.4 s, about 12,000 events/s |
+| Processed / duplicates / bad | 5,078,345 / 0 / 0 |
+| Lag at the end | 0 on every partition |
+| Arrived after a later event (`out_of_order`) | 233,971 (4.6%) |
+
+Event-time lateness, read straight from the histogram buckets:
+
+| Late by at most | Share of events |
+| --- | --- |
+| 0 s (in order) | 95.39% |
+| 1 minute | 96.13% |
+| 5 minutes | 98.72% |
+| 15 minutes | 99.23% |
+| 30 minutes | 99.37% |
+| 1 hour | 99.59% |
+| 2 hours | 100% |
+
+So p99 is between 5 and 15 minutes (about 10.5 by interpolation, as
+`histogram_quantile` would estimate it), p99.9 is between 1 and 2 hours, and
+nothing was later than 2 hours.
+
+**Where the lateness comes from.** Not from the data. The replayer sends in
+timestamp order and the idempotent producer keeps order within a partition,
+so each partition should arrive in order. The disorder comes from interleaving
+three partitions, and that is wall-clock skew: at speed 3600, one second of
+skew between partitions is one hour of event time. The 2-hour maximum is about
+2 seconds of skew; p99 is about 0.2 seconds. At real speed the same skew would
+be a second or two of event time.
+
+**Catching up is much worse.** In an earlier run the consumer started only
+after the replay had finished, so it read 5 million events as a backlog, in
+large batches from one partition at a time. Then 68% of events arrived out of
+order, the mean lateness was about 13 hours, and p99 was past the histogram's
+top bucket: at least 48 hours. The 66% in [streaming.md](streaming.md), from
+an early `--speed max` run, is the same effect.
+
+**What this means for the graph engine.** One stream-wide clock (the newest
+event seen) is the wrong watermark: a consumer catching up after a restart
+would push it days ahead and close windows on events still to come. The engine
+needs a watermark per partition and takes the slowest one as the stream's
+watermark, as Flink and Kafka Streams do. If each partition is in order, that
+leaves almost nothing late; a small allowance covers the rest, and anything
+later still is counted rather than silently dropped. Week 5 measures
+per-partition order to confirm it.
