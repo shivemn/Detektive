@@ -1,0 +1,10 @@
+target/
+data/
+results/
+ml/
+docs/
+observability/
+.git/
+.github/
+*.md
+!crates/**/*.md
