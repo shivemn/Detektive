@@ -274,6 +274,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "detektive-graph",
  "detektive-replay",
  "prometheus",
  "rdkafka",

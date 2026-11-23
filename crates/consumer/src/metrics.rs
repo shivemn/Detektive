@@ -10,8 +10,12 @@
 //!   arriving event's own timestamp is (`event_lateness_seconds`). This is about
 //!   the data, not the machines: it tells the graph engine how long to keep a
 //!   time window open for stragglers.
+//!
+//! The `detektive_graph_*` metrics describe the time-windowed graph: how much
+//! it holds, how much it evicts, and where its watermark is.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use axum::Router;
@@ -40,6 +44,13 @@ pub struct Metrics {
     pub end_to_end_latency: Histogram,
     pub event_lateness: Histogram,
     pub handle_time: Histogram,
+    pub watermark: IntGauge,
+    pub behind_partition: IntCounterVec,
+    pub graph_edges: IntGauge,
+    pub graph_accounts: IntGauge,
+    pub graph_bytes: IntGauge,
+    pub graph_evicted: IntCounter,
+    pub graph_too_late: IntCounter,
 }
 
 impl Metrics {
@@ -102,6 +113,37 @@ impl Metrics {
                     1e-6, 2.5e-6, 5e-6, 1e-5, 2.5e-5, 5e-5, 1e-4, 2.5e-4, 1e-3, 1e-2,
                 ]),
             )?,
+            watermark: IntGauge::new(
+                "detektive_consumer_watermark_seconds",
+                "Event time every partition has reached (the slowest active partition's newest event)",
+            )?,
+            behind_partition: IntCounterVec::new(
+                Opts::new(
+                    "detektive_consumer_behind_partition_total",
+                    "Events older than an event their own partition already delivered (expected: 0)",
+                ),
+                &["partition"],
+            )?,
+            graph_edges: IntGauge::new(
+                "detektive_graph_edges",
+                "Payments inside the graph window",
+            )?,
+            graph_accounts: IntGauge::new(
+                "detektive_graph_accounts",
+                "Accounts with at least one payment inside the window",
+            )?,
+            graph_bytes: IntGauge::new(
+                "detektive_graph_memory_bytes",
+                "Approximate memory held by the window's edges",
+            )?,
+            graph_evicted: IntCounter::new(
+                "detektive_graph_evicted_total",
+                "Payments evicted after leaving the window",
+            )?,
+            graph_too_late: IntCounter::new(
+                "detektive_graph_too_late_total",
+                "Payments already older than the window when they arrived, so not added",
+            )?,
             registry,
         };
         m.registry.register(Box::new(m.messages.clone()))?;
@@ -114,6 +156,13 @@ impl Metrics {
             .register(Box::new(m.end_to_end_latency.clone()))?;
         m.registry.register(Box::new(m.event_lateness.clone()))?;
         m.registry.register(Box::new(m.handle_time.clone()))?;
+        m.registry.register(Box::new(m.watermark.clone()))?;
+        m.registry.register(Box::new(m.behind_partition.clone()))?;
+        m.registry.register(Box::new(m.graph_edges.clone()))?;
+        m.registry.register(Box::new(m.graph_accounts.clone()))?;
+        m.registry.register(Box::new(m.graph_bytes.clone()))?;
+        m.registry.register(Box::new(m.graph_evicted.clone()))?;
+        m.registry.register(Box::new(m.graph_too_late.clone()))?;
         // make every outcome visible from the start, at 0
         for outcome in ["processed", "duplicate", "bad"] {
             m.messages.with_label_values(&[outcome]);
@@ -132,9 +181,33 @@ impl Metrics {
 }
 
 /// Plugs into librdkafka: receives its statistics every few seconds (the
-/// source of per-partition lag) and logs partition assignments.
+/// source of per-partition lag) and hears about partition assignments.
 pub struct MetricsContext {
     pub metrics: Arc<Metrics>,
+    pub assignment: Arc<Assignment>,
+}
+
+/// The partitions this consumer owns, handed from librdkafka's rebalance
+/// callback to the consume loop. The loop checks `take` on every message: one
+/// atomic load, and the list is only copied when it changed.
+#[derive(Default)]
+pub struct Assignment {
+    changed: AtomicBool,
+    partitions: Mutex<Vec<u32>>,
+}
+
+impl Assignment {
+    fn set(&self, partitions: Vec<u32>) {
+        *self.partitions.lock().unwrap() = partitions;
+        self.changed.store(true, Ordering::Release);
+    }
+
+    /// The new assignment, if it changed since the last call.
+    pub fn take(&self) -> Option<Vec<u32>> {
+        self.changed
+            .swap(false, Ordering::Acquire)
+            .then(|| self.partitions.lock().unwrap().clone())
+    }
 }
 
 impl ClientContext for MetricsContext {
@@ -159,8 +232,13 @@ impl ConsumerContext for MetricsContext {
     fn post_rebalance(&self, _: &rdkafka::consumer::BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
         match rebalance {
             Rebalance::Assign(list) => {
-                let parts: Vec<i32> = list.elements().iter().map(|e| e.partition()).collect();
+                let parts: Vec<u32> = list
+                    .elements()
+                    .iter()
+                    .filter_map(|e| u32::try_from(e.partition()).ok())
+                    .collect();
                 info!(?parts, "partitions assigned");
+                self.assignment.set(parts);
             }
             Rebalance::Revoke(_) => info!("partitions revoked"),
             Rebalance::Error(e) => tracing::warn!(%e, "rebalance error"),
@@ -205,6 +283,10 @@ mod tests {
             "detektive_consumer_handle_seconds_sum",
             "detektive_consumer_dead_lettered_total 0",
             "detektive_consumer_event_time_seconds 0",
+            "detektive_consumer_watermark_seconds 0",
+            "detektive_graph_edges 0",
+            "detektive_graph_evicted_total 0",
+            "detektive_graph_too_late_total 0",
         ] {
             assert!(text.contains(name), "missing {name} in\n{text}");
         }
@@ -215,6 +297,7 @@ mod tests {
         let dashboard = include_str!("../../../observability/grafana/dashboards/detektive.json");
         let m = Metrics::new().unwrap();
         m.lag.with_label_values(&["0"]).set(0);
+        m.behind_partition.with_label_values(&["0"]).inc_by(0);
         let exported: std::collections::HashSet<String> = m
             .render()
             .lines()
@@ -224,7 +307,7 @@ mod tests {
             .collect();
 
         let mut queried = 0;
-        for (start, _) in dashboard.match_indices("detektive_consumer_") {
+        for (start, _) in dashboard.match_indices("detektive_") {
             let name: String = dashboard[start..]
                 .chars()
                 .take_while(|c| c.is_ascii_lowercase() || *c == '_')
@@ -236,7 +319,7 @@ mod tests {
             queried += 1;
         }
         assert!(
-            queried >= 10,
+            queried >= 15,
             "expected the dashboard to query the consumer's metrics"
         );
     }

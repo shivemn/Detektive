@@ -6,7 +6,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use detektive_consumer::metrics::{self, Metrics};
-use detektive_consumer::{Config, run};
+use detektive_consumer::{Config, GraphSettings, run};
 
 /// Consume the payments stream from Redpanda and keep running counts.
 #[derive(Parser)]
@@ -44,6 +44,15 @@ struct Args {
     /// can tell the two apart.
     #[arg(long, default_value = "0.0.0.0:9899")]
     metrics_addr: String,
+
+    /// Hours of event time the payment graph keeps
+    #[arg(long, default_value_t = 24.0)]
+    window_hours: f64,
+
+    /// Seconds of silence after which a partition stops holding the
+    /// watermark back
+    #[arg(long, default_value_t = 10)]
+    idle_partition_secs: u64,
 }
 
 #[tokio::main]
@@ -63,6 +72,10 @@ async fn main() -> Result<()> {
         stop_after: args.stop_after,
         idle_timeout: args.idle_secs.map(Duration::from_secs),
         report_every: Duration::from_secs(args.report_secs),
+        graph: GraphSettings {
+            window: Duration::from_secs_f64(args.window_hours * 3600.0),
+            idle_partition: Duration::from_secs(args.idle_partition_secs),
+        },
     };
     let metrics = Arc::new(Metrics::new()?);
     if args.metrics_addr != "none" {
@@ -78,16 +91,21 @@ async fn main() -> Result<()> {
     };
     let summary = run(cfg, metrics, shutdown).await?;
     eprintln!(
-        "processed {} | duplicates {} | bad {} (dead-lettered {}) | out of order {} (latest by {}s of event time) | accounts {} | {:.2}s busy, {:.0} msgs/s",
+        "processed {} | duplicates {} | bad {} (dead-lettered {}) | out of order {} (latest by {}s of event time), {} behind their own partition | accounts {} | {:.2}s busy, {:.0} msgs/s",
         summary.processed,
         summary.duplicates,
         summary.bad,
         summary.dead_lettered,
         summary.out_of_order,
         summary.max_lateness,
+        summary.behind_partition,
         summary.accounts,
         summary.busy.as_secs_f64(),
         summary.per_second()
+    );
+    eprintln!(
+        "graph window: {} payments now, {} evicted, {} too late to add",
+        summary.window_edges, summary.evicted, summary.too_late
     );
     Ok(())
 }

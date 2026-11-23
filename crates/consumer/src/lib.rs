@@ -1,5 +1,5 @@
-//! Reads the `payments` topic, decodes each event and keeps running counts.
-//! The graph engine will live inside this service from week 5.
+//! Reads the `payments` topic, decodes each event, keeps running counts and
+//! adds every new payment to the time-windowed graph (`detektive-graph`).
 //!
 //! Delivery is at-least-once, built from three rules:
 //!
@@ -28,8 +28,10 @@ use rdkafka::message::{BorrowedMessage, Header, Message, OwnedHeaders, Timestamp
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use tracing::{info, warn};
 
-use crate::metrics::{Metrics, MetricsContext};
+use crate::metrics::{Assignment, Metrics, MetricsContext};
 use crate::state::{Outcome, State};
+
+pub use crate::state::GraphSettings;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -43,6 +45,7 @@ pub struct Config {
     /// Stop if no message arrives for this long (benchmarks and tests).
     pub idle_timeout: Option<Duration>,
     pub report_every: Duration,
+    pub graph: GraphSettings,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +58,14 @@ pub struct Summary {
     /// Largest event-time lateness seen, in seconds.
     pub max_lateness: i64,
     pub accounts: usize,
+    /// Events older than something their own partition had already
+    /// delivered. Expected to be 0.
+    pub behind_partition: u64,
+    /// Payments inside the graph window when the consumer stopped.
+    pub window_edges: usize,
+    pub evicted: u64,
+    /// Payments already older than the window when they arrived.
+    pub too_late: u64,
     /// From the first message to the last: the time spent actually consuming,
     /// without the group join before it or the idle wait after it.
     pub busy: Duration,
@@ -74,6 +85,7 @@ pub async fn run(
     metrics: Arc<Metrics>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<Summary> {
+    let assignment = Arc::new(Assignment::default());
     let consumer: StreamConsumer<MetricsContext> = ClientConfig::new()
         .set("bootstrap.servers", &cfg.brokers)
         .set("group.id", &cfg.group)
@@ -89,6 +101,7 @@ pub async fn run(
         .set("statistics.interval.ms", "5000")
         .create_with_context(MetricsContext {
             metrics: metrics.clone(),
+            assignment: assignment.clone(),
         })
         .with_context(|| format!("connecting consumer to {}", cfg.brokers))?;
     consumer.subscribe(&[&cfg.topic]).context("subscribing")?;
@@ -105,7 +118,7 @@ pub async fn run(
     };
 
     info!(topic = %cfg.topic, group = %cfg.group, "consuming");
-    let mut state = State::new();
+    let mut state = State::new(cfg.graph);
     let mut dead_lettered = 0u64;
     let mut progress = Progress::new();
     let mut first_message: Option<Instant> = None;
@@ -150,15 +163,25 @@ pub async fn run(
                 if let Some(latency) = end_to_end_latency(message.timestamp()) {
                     metrics.end_to_end_latency.observe(latency);
                 }
-                let outcome = state.handle(message.payload());
+                // partitions just assigned hold the watermark until they deliver
+                if let Some(partitions) = assignment.take() {
+                    state.assign(&partitions, last_message);
+                }
+                let partition = u32::try_from(message.partition()).unwrap_or(0);
+                let before = state.graph.stats();
+                let outcome = state.handle(partition, message.payload(), last_message);
                 metrics.handle_time.observe(last_message.elapsed().as_secs_f64());
                 match outcome {
-                    Outcome::Processed { lateness } => {
+                    Outcome::Processed { lateness, behind_partition, too_late: _ } => {
                         metrics.messages.with_label_values(&["processed"]).inc();
                         metrics.event_lateness.observe(lateness as f64);
                         if lateness > 0 {
                             metrics.out_of_order.inc();
                         }
+                        if behind_partition > 0 {
+                            metrics.behind_partition.with_label_values(&[&partition.to_string()]).inc();
+                        }
+                        record_graph(&metrics, &state, before);
                     }
                     Outcome::Duplicate => metrics.messages.with_label_values(&["duplicate"]).inc(),
                     Outcome::Bad(reason) => {
@@ -191,7 +214,12 @@ pub async fn run(
     consumer.unsubscribe();
     progress.log(&state);
 
+    let graph = state.graph.stats();
     Ok(Summary {
+        behind_partition: state.behind_partition(),
+        window_edges: graph.edges,
+        evicted: graph.evicted,
+        too_late: graph.too_late,
         processed: state.processed,
         duplicates: state.duplicates,
         bad: state.bad,
@@ -203,6 +231,22 @@ pub async fn run(
             .map(|first| last_message - first)
             .unwrap_or_default(),
     })
+}
+
+/// Update the graph metrics after a payment went in. `before` is the graph
+/// as it was just before, so the counters move by exactly what changed.
+fn record_graph(metrics: &Metrics, state: &State, before: detektive_graph::Stats) {
+    let after = state.graph.stats();
+    metrics.graph_edges.set(after.edges as i64);
+    metrics.graph_accounts.set(after.accounts as i64);
+    metrics.graph_bytes.set(after.approx_bytes() as i64);
+    metrics.graph_evicted.inc_by(after.evicted - before.evicted);
+    metrics
+        .graph_too_late
+        .inc_by(after.too_late - before.too_late);
+    if let Some(w) = state.watermarks.current() {
+        metrics.watermark.set(w);
+    }
 }
 
 /// Seconds since the producer wrote the message, from the timestamp it set.
@@ -288,6 +332,8 @@ impl Progress {
             duplicates = state.duplicates,
             bad = state.bad,
             out_of_order = state.out_of_order,
+            behind_partition = state.behind_partition(),
+            window_edges = state.graph.stats().edges,
             accounts = state.accounts(),
             rate = format!("{rate:.0}/s"),
             "progress"

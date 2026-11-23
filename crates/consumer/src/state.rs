@@ -4,24 +4,53 @@
 //! The stream is at-least-once: after a crash, messages processed but not yet
 //! committed come back. Every event carries a unique `tx_id`, so repeats are
 //! recognised and skipped instead of being counted twice.
+//!
+//! Every new payment goes into the time-windowed graph. The window moves with
+//! the watermark, the slowest partition's clock, so a partition that is
+//! behind never has its payments evicted before they arrive.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+use detektive_graph::{Arrival, Insert, Payment, Watermarks, WindowGraph};
 
 use crate::bitset::BitSet;
 use crate::event::{DecodeError, decode};
 
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
-    /// `lateness`: seconds this event's time is behind the newest event seen
-    /// before it (0 when it arrives in order).
     Processed {
+        /// Seconds this event's time is behind the newest event seen before
+        /// it, from any partition (0 when it arrives in order).
         lateness: i64,
+        /// Seconds it is behind the newest event from its own partition.
+        /// Should always be 0: each partition arrives in order.
+        behind_partition: i64,
+        /// Already older than the graph window, so not added to it.
+        too_late: bool,
     },
     Duplicate,
     Bad(DecodeError),
 }
 
-#[derive(Debug, Default)]
+/// How much event time the graph keeps, and when a silent partition stops
+/// holding the watermark back.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GraphSettings {
+    pub window: Duration,
+    pub idle_partition: Duration,
+}
+
+impl Default for GraphSettings {
+    fn default() -> Self {
+        Self {
+            window: Duration::from_secs(24 * 3600),
+            idle_partition: Duration::from_secs(10),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct State {
     seen_tx: BitSet,
     seen_accounts: BitSet,
@@ -36,14 +65,35 @@ pub struct State {
     /// The latest any event arrived, in seconds of event time.
     pub max_lateness: i64,
     pub by_format: BTreeMap<String, u64>,
+    pub watermarks: Watermarks,
+    pub graph: WindowGraph,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self::new(GraphSettings::default())
+    }
 }
 
 impl State {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(settings: GraphSettings) -> Self {
+        Self {
+            seen_tx: BitSet::default(),
+            seen_accounts: BitSet::default(),
+            processed: 0,
+            duplicates: 0,
+            bad: 0,
+            out_of_order: 0,
+            max_ts: None,
+            max_lateness: 0,
+            by_format: BTreeMap::new(),
+            watermarks: Watermarks::new(settings.idle_partition),
+            graph: WindowGraph::new(settings.window.as_secs() as i64),
+        }
     }
 
-    pub fn handle(&mut self, payload: Option<&[u8]>) -> Outcome {
+    /// Handle one message from `partition`, read at `now`.
+    pub fn handle(&mut self, partition: u32, payload: Option<&[u8]>, now: Instant) -> Outcome {
         let event = match decode(payload) {
             Ok(e) => e,
             Err(e) => {
@@ -77,7 +127,37 @@ impl State {
                 self.by_format.insert(event.format.into_owned(), 1);
             }
         }
-        Outcome::Processed { lateness }
+
+        let behind_partition = match self.watermarks.observe(partition, event.ts, now) {
+            Arrival::InOrder => 0,
+            Arrival::BehindPartition(secs) => secs,
+        };
+        if let Some(w) = self.watermarks.advance(now) {
+            self.graph.advance(w);
+        }
+        let inserted = self.graph.insert(Payment {
+            tx: event.tx_id,
+            ts: event.ts,
+            src: event.src,
+            dst: event.dst,
+            amount: event.amount,
+        });
+        Outcome::Processed {
+            lateness,
+            behind_partition,
+            too_late: inserted == Insert::TooLate,
+        }
+    }
+
+    /// The partitions this consumer now owns (after a rebalance).
+    pub fn assign(&mut self, partitions: &[u32], now: Instant) {
+        self.watermarks.assign(partitions, now);
+    }
+
+    /// Events that arrived older than something their own partition had
+    /// already delivered, summed over partitions.
+    pub fn behind_partition(&self) -> u64 {
+        self.watermarks.out_of_order().map(|(_, n)| n).sum()
     }
 
     /// Every message looked at, whatever its outcome.
@@ -101,17 +181,30 @@ mod tests {
         .into_bytes()
     }
 
+    fn in_order(lateness: i64) -> Outcome {
+        Outcome::Processed {
+            lateness,
+            behind_partition: 0,
+            too_late: false,
+        }
+    }
+
+    /// Everything from partition 0, read now.
+    fn handle(s: &mut State, payload: Option<&[u8]>) -> Outcome {
+        s.handle(0, payload, Instant::now())
+    }
+
     #[test]
     fn counts_events_accounts_and_formats() {
-        let mut s = State::new();
+        let mut s = State::default();
         for (id, ts, src, dst, fmt) in [
             (0, 10, 1, 2, "ach"),
             (1, 20, 2, 3, "ach"),
             (2, 30, 3, 3, "wire"),
         ] {
             assert_eq!(
-                s.handle(Some(&event(id, ts, src, dst, fmt))),
-                Outcome::Processed { lateness: 0 }
+                handle(&mut s, Some(&event(id, ts, src, dst, fmt))),
+                in_order(0)
             );
         }
         assert_eq!(s.processed, 3);
@@ -122,35 +215,87 @@ mod tests {
 
     #[test]
     fn redelivered_events_are_skipped() {
-        let mut s = State::new();
+        let mut s = State::default();
         let e = event(9, 10, 1, 2, "ach");
-        assert_eq!(s.handle(Some(&e)), Outcome::Processed { lateness: 0 });
-        assert_eq!(s.handle(Some(&e)), Outcome::Duplicate);
+        assert_eq!(handle(&mut s, Some(&e)), in_order(0));
+        assert_eq!(handle(&mut s, Some(&e)), Outcome::Duplicate);
         assert_eq!((s.processed, s.duplicates), (1, 1));
+        assert_eq!(s.graph.stats().edges, 1, "a repeat is not a second edge");
     }
 
     #[test]
     fn late_events_are_counted_but_do_not_move_time_back() {
-        let mut s = State::new();
-        s.handle(Some(&event(0, 100, 1, 2, "ach")));
+        let mut s = State::default();
+        handle(&mut s, Some(&event(0, 100, 1, 2, "ach")));
+        // from another partition: late for the stream, in order for its own
+        let now = Instant::now();
         assert_eq!(
-            s.handle(Some(&event(1, 50, 1, 2, "ach"))),
-            Outcome::Processed { lateness: 50 }
+            s.handle(1, Some(&event(1, 50, 1, 2, "ach")), now),
+            in_order(50)
         );
         assert_eq!(
-            s.handle(Some(&event(2, 90, 1, 2, "ach"))),
-            Outcome::Processed { lateness: 10 }
+            s.handle(1, Some(&event(2, 90, 1, 2, "ach")), now),
+            in_order(10)
         );
         assert_eq!(s.out_of_order, 2);
         assert_eq!(s.max_ts, Some(100));
         assert_eq!(s.max_lateness, 50);
+        assert_eq!(s.behind_partition(), 0);
+    }
+
+    #[test]
+    fn an_event_behind_its_own_partition_is_flagged() {
+        let mut s = State::default();
+        handle(&mut s, Some(&event(0, 100, 1, 2, "ach")));
+        assert_eq!(
+            handle(&mut s, Some(&event(1, 40, 1, 2, "ach"))),
+            Outcome::Processed {
+                lateness: 60,
+                behind_partition: 60,
+                too_late: false
+            }
+        );
+        assert_eq!(s.behind_partition(), 1);
+    }
+
+    #[test]
+    fn the_window_follows_the_slowest_partition() {
+        let hour = 3600;
+        let mut s = State::new(GraphSettings {
+            window: Duration::from_secs(hour as u64),
+            idle_partition: Duration::from_secs(10),
+        });
+        let now = Instant::now();
+        s.handle(0, Some(&event(0, 0, 1, 2, "ach")), now);
+        s.handle(1, Some(&event(1, 0, 3, 4, "ach")), now);
+        // partition 0 races three hours ahead; partition 1 is still at 0,
+        // so nothing may be evicted yet
+        s.handle(0, Some(&event(2, 3 * hour, 5, 6, "ach")), now);
+        assert_eq!(s.graph.stats().edges, 3);
+        // partition 1 catches up: now the first two leave the window
+        s.handle(1, Some(&event(3, 3 * hour, 7, 8, "ach")), now);
+        assert_eq!(s.graph.stats().edges, 2);
+        assert_eq!(s.graph.stats().evicted, 2);
+    }
+
+    #[test]
+    fn payments_older_than_the_window_are_not_added() {
+        let mut s = State::new(GraphSettings {
+            window: Duration::from_secs(60),
+            idle_partition: Duration::from_secs(10),
+        });
+        let now = Instant::now();
+        s.handle(0, Some(&event(0, 1000, 1, 2, "ach")), now);
+        let outcome = s.handle(1, Some(&event(1, 900, 1, 2, "ach")), now);
+        assert!(matches!(outcome, Outcome::Processed { too_late: true, .. }));
+        assert_eq!(s.graph.stats().edges, 1);
     }
 
     #[test]
     fn bad_messages_are_reported_not_fatal() {
-        let mut s = State::new();
-        assert!(matches!(s.handle(Some(b"garbage")), Outcome::Bad(_)));
-        assert_eq!(s.handle(None), Outcome::Bad(DecodeError::Empty));
+        let mut s = State::default();
+        assert!(matches!(handle(&mut s, Some(b"garbage")), Outcome::Bad(_)));
+        assert_eq!(handle(&mut s, None), Outcome::Bad(DecodeError::Empty));
         assert_eq!((s.bad, s.processed), (2, 0));
     }
 }

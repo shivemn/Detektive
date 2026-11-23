@@ -9,6 +9,7 @@ license.workspace = true
 anyhow = "1.0.104"
 axum = "0.8.9"
 clap = { version = "4.6.9", features = ["derive"] }
+detektive-graph = { path = "../graph" }
 prometheus = { version = "0.14.0", default-features = false }
 rdkafka = { version = "0.39.0", features = ["cmake-build", "libz-static"] }
 serde = { version = "1.0.229", features = ["derive"] }

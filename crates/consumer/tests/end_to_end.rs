@@ -75,6 +75,7 @@ fn config(brokers: &str, group: &str) -> Config {
         stop_after: None,
         idle_timeout: Some(Duration::from_secs(5)),
         report_every: Duration::from_secs(60),
+        graph: Default::default(),
     }
 }
 
@@ -110,6 +111,15 @@ async fn every_replayed_event_arrives_exactly_once() {
     assert_eq!(summary.processed, 3_000);
     assert_eq!((summary.duplicates, summary.bad), (0, 0));
     assert_eq!(summary.accounts, distinct_accounts(&txs));
+
+    // three partitions, read at their own pace: each must still arrive in
+    // order, and with the watermark on the slowest one nothing is refused
+    assert_eq!(summary.behind_partition, 0);
+    assert_eq!(summary.too_late, 0);
+    // 50 hours of payments through a 24-hour window: every payment is either
+    // still in it or was evicted from it
+    assert!(summary.evicted > 0);
+    assert_eq!(summary.window_edges as u64 + summary.evicted, 3_000);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -336,6 +346,12 @@ async fn metrics_endpoint_reports_what_the_consumer_did() {
         metric(&text, "detektive_consumer_event_time_seconds"),
         (1_661_990_400 + 499 * 60) as f64
     );
+    // 500 minutes of payments all fit in the 24-hour window
+    assert_eq!(metric(&text, "detektive_graph_edges"), 500.0);
+    assert_eq!(metric(&text, "detektive_graph_evicted_total"), 0.0);
+    assert_eq!(summary.window_edges, 500);
+    let watermark = metric(&text, "detektive_consumer_watermark_seconds");
+    assert!(watermark >= 1_661_990_400.0 && watermark <= (1_661_990_400 + 499 * 60) as f64);
     // everything was read, so every partition's lag is 0
     let lag: Vec<f64> = (0..3)
         .map(|p| {
