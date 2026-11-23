@@ -100,6 +100,10 @@ time for lateness.
 | `detektive_graph_too_late_total` | counter | Payments older than the window on arrival, not added |
 | `detektive_graph_receiver_fan_in` | histogram | Receiver's fan-in at each payment |
 | `detektive_graph_sender_fan_out` | histogram | Sender's fan-out at each payment |
+| `detektive_graph_cycles_total` | counter | Temporal cycles closed by payments |
+| `detektive_graph_shortest_cycle` | histogram | Length of the shortest cycle, per payment closing one |
+| `detektive_graph_live_cycles` | gauge | Cycles found whose payments are all still in the window |
+| `detektive_graph_cycle_search_truncated_total` | counter | Cycle searches stopped at their budget (expected 0) |
 
 What the graph metrics mean: [graph-engine.md](graph-engine.md).
 

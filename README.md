@@ -10,13 +10,13 @@ arrives. Every alert says which pattern it matched and why.
 The engine will be written in Rust. Models are trained in Python and served
 from Rust through ONNX.
 
-> **Status: week 6 of about 24.** What exists today is the data pipeline, the
+> **Status: week 7 of about 24.** What exists today is the data pipeline, the
 > evaluation protocol, a floor baseline, a Rust replayer that streams the data
 > in time order, a consumer service reading that stream from Redpanda,
-> Prometheus metrics with a Grafana dashboard, and the start of the graph
-> engine: a time-windowed payment graph with per-partition watermarks and
-> degree and fan features for every payment. No pattern detectors or models
-> on graph features yet.
+> Prometheus metrics with a Grafana dashboard, and the first half of the
+> graph engine: a time-windowed payment graph with per-partition watermarks,
+> degree and fan features for every payment, and temporal cycle detection.
+> No scatter-gather detection or models on graph features yet.
 
 ## Data
 
@@ -72,17 +72,25 @@ kept apart: [docs/observability.md](docs/observability.md).
 ## The graph engine
 
 `crates/graph` keeps a live graph of who paid whom over a sliding window of
-event time (24 hours by default) and evicts what leaves it, so memory follows
-the window, not the length of the stream: about 76 MB for the fullest
-24-hour window of HI-Small (1.1 million payments). Eviction follows a
+event time (four days by default) and evicts what leaves it, so memory follows
+the window, not the length of the stream: about 146 MB for the fullest
+four-day window of HI-Small (2.3 million payments). Eviction follows a
 watermark kept per partition, so a partition that is behind never loses
-payments that are still on their way. For every payment it reads nine
-features off the window (degree, fan-in, fan-out and repeats, for both
-accounts) in constant time, using counts kept up to date as payments enter
-and leave; 1.2 million payments a second on one core. Every feature matches
-an independent brute-force recount in Python. On HI-Small, 83% of laundering
-payments are the sender's first payment to that receiver in 24 hours, against
-39% of normal ones. Design, measurements and tests:
+payments that are still on their way.
+
+For every payment it reads degree, fan-in, fan-out and repeats for both
+accounts off the window in constant time, from counts kept up to date as
+payments enter and leave; every value matches an independent brute-force
+recount in Python. On HI-Small, 83% of laundering payments are the sender's
+first payment to that receiver in 24 hours, against 39% of normal ones.
+
+It also finds the temporal cycles each payment closes (money coming back to
+where it started, each payment no earlier than the one before), up to 12
+payments long. It caught 49 of the 54 laundering cycles listed with HI-Small,
+every one whose payments are in time order, as each closed. Payments that
+close a ring of three or more are laundering 61.5% of the time, against a
+base rate of 0.10%. The whole engine runs at about 360,000 payments a second
+on one core. Design, measurements and tests:
 [docs/graph-engine.md](docs/graph-engine.md).
 
 ## Running it
