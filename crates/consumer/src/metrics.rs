@@ -33,6 +33,11 @@ use rdkafka::statistics::Statistics;
 use tokio::net::TcpListener;
 use tracing::info;
 
+/// Fan counts are mostly 1 to 3, with rare hubs in the thousands.
+const FAN_BUCKETS: [f64; 14] = [
+    1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0,
+];
+
 pub struct Metrics {
     registry: Registry,
     pub messages: IntCounterVec,
@@ -51,6 +56,8 @@ pub struct Metrics {
     pub graph_bytes: IntGauge,
     pub graph_evicted: IntCounter,
     pub graph_too_late: IntCounter,
+    pub receiver_fan_in: Histogram,
+    pub sender_fan_out: Histogram,
 }
 
 impl Metrics {
@@ -144,6 +151,20 @@ impl Metrics {
                 "detektive_graph_too_late_total",
                 "Payments already older than the window when they arrived, so not added",
             )?,
+            receiver_fan_in: Histogram::with_opts(
+                HistogramOpts::new(
+                    "detektive_graph_receiver_fan_in",
+                    "Distinct accounts that paid the receiver inside the window, per payment",
+                )
+                .buckets(FAN_BUCKETS.to_vec()),
+            )?,
+            sender_fan_out: Histogram::with_opts(
+                HistogramOpts::new(
+                    "detektive_graph_sender_fan_out",
+                    "Distinct accounts the sender paid inside the window, per payment",
+                )
+                .buckets(FAN_BUCKETS.to_vec()),
+            )?,
             registry,
         };
         m.registry.register(Box::new(m.messages.clone()))?;
@@ -163,6 +184,8 @@ impl Metrics {
         m.registry.register(Box::new(m.graph_bytes.clone()))?;
         m.registry.register(Box::new(m.graph_evicted.clone()))?;
         m.registry.register(Box::new(m.graph_too_late.clone()))?;
+        m.registry.register(Box::new(m.receiver_fan_in.clone()))?;
+        m.registry.register(Box::new(m.sender_fan_out.clone()))?;
         // make every outcome visible from the start, at 0
         for outcome in ["processed", "duplicate", "bad"] {
             m.messages.with_label_values(&[outcome]);

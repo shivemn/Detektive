@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use detektive_graph::{Arrival, Insert, Payment, Watermarks, WindowGraph};
+use detektive_graph::{Arrival, Features, Insert, Payment, Watermarks, WindowGraph};
 
 use crate::bitset::BitSet;
 use crate::event::{DecodeError, decode};
@@ -28,6 +28,9 @@ pub enum Outcome {
         behind_partition: i64,
         /// Already older than the graph window, so not added to it.
         too_late: bool,
+        /// Degree and fan features of the payment, read from the window
+        /// right after it went in. `None` if it was too late to go in.
+        features: Option<Features>,
     },
     Duplicate,
     Bad(DecodeError),
@@ -135,17 +138,19 @@ impl State {
         if let Some(w) = self.watermarks.advance(now) {
             self.graph.advance(w);
         }
-        let inserted = self.graph.insert(Payment {
+        let payment = Payment {
             tx: event.tx_id,
             ts: event.ts,
             src: event.src,
             dst: event.dst,
             amount: event.amount,
-        });
+        };
+        let inserted = self.graph.insert(payment);
         Outcome::Processed {
             lateness,
             behind_partition,
             too_late: inserted == Insert::TooLate,
+            features: (inserted == Insert::Added).then(|| self.graph.features(&payment)),
         }
     }
 
@@ -186,12 +191,31 @@ mod tests {
             lateness,
             behind_partition: 0,
             too_late: false,
+            features: None,
         }
     }
 
-    /// Everything from partition 0, read now.
+    /// The outcome without its features, which have their own tests.
+    fn strip(o: Outcome) -> Outcome {
+        match o {
+            Outcome::Processed {
+                lateness,
+                behind_partition,
+                too_late,
+                ..
+            } => Outcome::Processed {
+                lateness,
+                behind_partition,
+                too_late,
+                features: None,
+            },
+            other => other,
+        }
+    }
+
+    /// Everything from partition 0, read now; features stripped.
     fn handle(s: &mut State, payload: Option<&[u8]>) -> Outcome {
-        s.handle(0, payload, Instant::now())
+        strip(s.handle(0, payload, Instant::now()))
     }
 
     #[test]
@@ -230,11 +254,11 @@ mod tests {
         // from another partition: late for the stream, in order for its own
         let now = Instant::now();
         assert_eq!(
-            s.handle(1, Some(&event(1, 50, 1, 2, "ach")), now),
+            strip(s.handle(1, Some(&event(1, 50, 1, 2, "ach")), now)),
             in_order(50)
         );
         assert_eq!(
-            s.handle(1, Some(&event(2, 90, 1, 2, "ach")), now),
+            strip(s.handle(1, Some(&event(2, 90, 1, 2, "ach")), now)),
             in_order(10)
         );
         assert_eq!(s.out_of_order, 2);
@@ -252,7 +276,8 @@ mod tests {
             Outcome::Processed {
                 lateness: 60,
                 behind_partition: 60,
-                too_late: false
+                too_late: false,
+                features: None,
             }
         );
         assert_eq!(s.behind_partition(), 1);
@@ -289,6 +314,21 @@ mod tests {
         let outcome = s.handle(1, Some(&event(1, 900, 1, 2, "ach")), now);
         assert!(matches!(outcome, Outcome::Processed { too_late: true, .. }));
         assert_eq!(s.graph.stats().edges, 1);
+    }
+
+    #[test]
+    fn each_payment_comes_with_its_features() {
+        let mut s = State::default();
+        let now = Instant::now();
+        s.handle(0, Some(&event(0, 10, 1, 9, "ach")), now);
+        s.handle(0, Some(&event(1, 20, 2, 9, "ach")), now);
+        let Outcome::Processed {
+            features: Some(f), ..
+        } = s.handle(0, Some(&event(2, 30, 9, 5, "wire")), now)
+        else {
+            panic!("expected features");
+        };
+        assert_eq!((f.src_fan_in, f.src_out_degree, f.pair_count), (2, 1, 1));
     }
 
     #[test]

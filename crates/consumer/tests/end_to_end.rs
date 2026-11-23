@@ -350,6 +350,12 @@ async fn metrics_endpoint_reports_what_the_consumer_did() {
     assert_eq!(metric(&text, "detektive_graph_edges"), 500.0);
     assert_eq!(metric(&text, "detektive_graph_evicted_total"), 0.0);
     assert_eq!(summary.window_edges, 500);
+    // one fan-in and one fan-out observation per payment
+    assert_eq!(
+        metric(&text, "detektive_graph_receiver_fan_in_count"),
+        500.0
+    );
+    assert_eq!(metric(&text, "detektive_graph_sender_fan_out_count"), 500.0);
     let watermark = metric(&text, "detektive_consumer_watermark_seconds");
     assert!(watermark >= 1_661_990_400.0 && watermark <= (1_661_990_400 + 499 * 60) as f64);
     // everything was read, so every partition's lag is 0

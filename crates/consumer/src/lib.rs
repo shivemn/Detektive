@@ -172,7 +172,7 @@ pub async fn run(
                 let outcome = state.handle(partition, message.payload(), last_message);
                 metrics.handle_time.observe(last_message.elapsed().as_secs_f64());
                 match outcome {
-                    Outcome::Processed { lateness, behind_partition, too_late: _ } => {
+                    Outcome::Processed { lateness, behind_partition, features, .. } => {
                         metrics.messages.with_label_values(&["processed"]).inc();
                         metrics.event_lateness.observe(lateness as f64);
                         if lateness > 0 {
@@ -180,6 +180,10 @@ pub async fn run(
                         }
                         if behind_partition > 0 {
                             metrics.behind_partition.with_label_values(&[&partition.to_string()]).inc();
+                        }
+                        if let Some(f) = features {
+                            metrics.receiver_fan_in.observe(f64::from(f.dst_fan_in));
+                            metrics.sender_fan_out.observe(f64::from(f.src_fan_out));
                         }
                         record_graph(&metrics, &state, before);
                     }
