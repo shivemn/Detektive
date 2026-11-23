@@ -1,14 +1,16 @@
 # Graph engine
 
-Weeks 5 and 6 add the engine's core: a live graph of who paid whom over a
+Weeks 5 to 7 add the engine's core: a live graph of who paid whom over a
 sliding window of event time (`crates/graph`), fed by the consumer, and the
-first features read off it for every payment: degree, fan-in, fan-out and
-repeats between a pair.
+first features read off it for every payment: degree, fan-in, fan-out,
+repeats between a pair (week 6), and the temporal cycles a payment closes
+(week 7).
 
 ```
 Redpanda --> consumer --> watermarks (one clock per partition)
-                     \--> window graph --advance--> evict old payments
-                                       --insert---> features for this payment
+                     \--> engine: window graph --advance--> evict old payments
+                                              --insert---> degree and fan features
+                                              --search---> cycles this payment closes
 ```
 
 ## The window graph
@@ -17,8 +19,8 @@ Accounts are nodes. Every payment is its own edge, so two accounts can be
 joined by many edges: a **directed multigraph**. Laundering patterns are
 about time as much as structure ("14 new accounts paid in within a few hours,
 then the money left"), so the graph only keeps payments inside a window of
-event time, 24 hours by default. When the watermark passes `t`, every payment
-older than `t - window` is evicted.
+event time, four days by default (the cycles section explains why). When the
+watermark passes `t`, every payment older than `t - window` is evicted.
 
 **Layout.** Each account has two adjacency lists, payments out and payments
 in, with the time, the other account and the amount stored in the list
@@ -40,22 +42,24 @@ by the window, so a lingering payment is never seen.
 
 **Bounded memory.** Memory follows the number of payments inside one window,
 not how long the stream has run. An account with nothing left in the window
-gives its memory back. On HI-Small (the fullest window is the first day,
-which is unusually busy):
+gives its memory back. On HI-Small (the fullest windows are the first days,
+which are unusually busy):
 
 | Window | Largest window | Accounts in it | Approx. memory | Speed, whole file |
 | --- | --- | --- | --- | --- |
-| 1 hour | 344,747 payments | 272,661 | 25 MB | 1.7 M payments/s |
-| 6 hours | 511,935 | 330,479 | 36 MB | 1.2 M/s |
-| 24 hours | 1,115,882 | 437,135 | 76 MB | 1.2 M/s |
-| 72 hours | 2,077,379 | 510,778 | 134 MB | 1.3 M/s |
+| 1 hour | 344,747 payments | 272,661 | 25 MB | 1.46 M payments/s |
+| 24 hours | 1,115,882 | 437,135 | 76 MB | 0.72 M/s |
+| **4 days (default)** | 2,284,988 | 511,553 | 146 MB | 0.36 M/s |
+| 7 days | 3,732,489 | 513,515 | 228 MB | 0.19 M/s |
 
-One core of a cloud VM, release build, after loading the file, with features
-computed for every payment but not written out. Writing all features to CSV
-as well: 0.72 M payments/s. Run it yourself:
+One core of a cloud VM, release build, after loading the file, with every
+feature (degree, fan and cycles) computed for every payment but not written
+out. Most of the time goes to the cycle search, whose cost grows with the
+window; the degree and fan features alone ran at 1.2 to 1.7 M payments/s for
+any of these windows. Run it yourself:
 
 ```bash
-cargo run --release -p detektive-graph -- data/raw/HI-Small_Trans.csv --window-hours 24
+cargo run --release -p detektive-graph -- data/raw/HI-Small_Trans.csv
 ```
 
 ## Watermarks
@@ -110,8 +114,8 @@ For a payment from S to R, right after it goes into the window:
 
 Degree counts repeats; fan counts distinct counterparties. These are the
 simplest graph features and the ones the Graph Feature Preprocessor
-(Blanuša et al., 2024) starts from; cycles and scatter-gather follow in
-weeks 7 and 8.
+(Blanuša et al., 2024) starts from; cycles follow below, scatter-gather in
+week 8.
 
 **Streaming aggregation.** Recounting a neighbourhood for every payment would
 cost as much as the account's degree, and the busiest account in HI-Small
@@ -121,8 +125,8 @@ payment enters the window and when it leaves. Fan-out is the number of
 counterparties with a non-zero count; the pair count is one lookup. All nine
 features cost nine lookups for any account, hub or not.
 
-**Degree distribution.** In the fullest 24-hour window of HI-Small (437,073
-accounts):
+**Degree distribution.** Measured in week 6, when the window was 24 hours.
+In the fullest 24-hour window of HI-Small (437,073 accounts):
 
 | | median | p99 | p99.9 | max |
 | --- | --- | --- | --- | --- |
@@ -151,6 +155,86 @@ dealing with each other, into accounts that are collecting from several
 places. That is what the single-row floor model in the results table cannot
 see.
 
+## Cycles (week 7)
+
+A cycle is money that comes back: A pays B, B pays C, C pays A. In a
+**temporal** cycle the payments also happen in that order, each no earlier
+than the one before. Laundering cycles have to be temporal, since money must
+arrive before it can move on. A ring whose payments run backwards in time is
+just accounts that know each other.
+
+| Feature | Meaning |
+| --- | --- |
+| `cycles` | distinct temporal cycles this payment closes |
+| `shortest_cycle` | payments in the shortest of them (0 if none) |
+| `src_cycles`, `dst_cycles` | cycles found in the window that S / R is part of |
+
+A cycle is only found when its last payment arrives, after the earlier ones
+were scored. `src_cycles` and `dst_cycles` carry the finding to every later
+payment of the accounts in the ring, until the ring's oldest payment leaves
+the window.
+
+**Why the window is now four days.** The patterns file that comes with
+HI-Small lists 54 laundering cycles, of 2 to 12 payments each. They take
+days, not hours:
+
+| A cycle's payments all fall within | 6 h | 24 h | 48 h | 72 h | 96 h |
+| --- | --- | --- | --- | --- | --- |
+| cycles (of 54) | 1 | 5 | 12 | 27 | 54 |
+
+The longest takes 95.6 hours. With the week 6 window of 24 hours the engine
+could see at most 5 of them; with four days it can see all. The fan patterns
+are just as slow (median 77 to 85 hours), so the degree and fan features
+moved to the same window.
+
+**The search.** When a payment from U to V arrives, every new cycle it
+completes ends with it. So the search looks for chains V → … → U whose
+payments are in time order, no later than this one, inside the window, with
+no account twice, and at most 12 payments including this one. It runs
+backwards from U over payments *into* each account, going back in time:
+
+- time only runs one way, so every step tightens the bound on the next
+  (earlier) payment, and most chains die within a step or two;
+- it goes against the grain of fan-out. An account pays up to 14,230 others
+  in four days but is paid by at most 545, so walking incoming payments
+  branches far less than walking outgoing ones.
+
+**Counting accounts, not payments.** Ten payments each way between B and C
+would be a hundred cycles if every combination counted, and it is one ring.
+A cycle here is a sequence of accounts with at least one run of payments in
+time order. Between each pair the search takes the latest suitable payment:
+the later that one is, the more room earlier payments have, so if any run
+exists, this one does. Each search also returns the shortest cycle it found
+as actual payments, oldest first: the start of an explanation for an alert.
+
+**A budget.** Enumerating cycles is exponential in the worst case. Each
+search may look at 100,000 payments (`--cycle-budget`); past that it stops
+and says so, and the consumer counts it. On HI-Small no search reached it.
+
+**Results on HI-Small** (4-day window, cycles of up to 12 payments, the
+whole file in time order):
+
+- 3,357 payments closed 3,602 cycles; no search ran out of budget.
+- **49 of the 54 laundering cycles were caught as they closed**: every one
+  of the 49 whose payments are in time order. The other 5 (rings of 4, 7, 7,
+  7 and 10 payments) are rings whose payments are not in time order: in one,
+  the second payment happens a day after the third. By the definition above
+  they are not cycles money could flow round, so the search does not see
+  them. With the old 24-hour window it caught 11.
+- Among all payments, 0.10% are laundering. Among the 3,357 that close a
+  cycle, 9.7% are; among the 91 whose shortest cycle has 3 or more payments,
+  61.5% are. Rings of two (A pays B, B pays A) are mostly normal (8.3%
+  laundering) but still 80 times the base rate. Payments by or to an account
+  already in a cycle: 1.6% of 26,446. As before, this is a description over
+  the whole file, not a model result.
+
+Reproduce it (needs the patterns file next to the data):
+
+```bash
+cargo run --release -p detektive-graph -- data/raw/HI-Small_Trans.csv --features features.csv
+python -m detektive_ml.cycle_report data/raw/HI-Small_Trans.csv data/raw/HI-Small_Patterns.txt features.csv
+```
+
 ## How it is tested
 
 - **Against a brute-force reference** (`crates/graph/tests/reference.rs`):
@@ -161,6 +245,15 @@ see.
   counts, the edges themselves, live payments, accounts and counterparty
   pairs. 30 random streams; the test checks that eviction and refusal both
   actually happen in them.
+- **Cycles against brute force** (`crates/graph/tests/cycles_reference.rs`):
+  for every payment of 60 random streams (small, dense, with parallel
+  payments, payments to oneself and late payments), list every chain of
+  individual payments from the receiver back to the sender in time order,
+  with no shortcuts, and group them by accounts. The engine must find exactly
+  the same cycles, the same shortest length, the same oldest-payment time
+  for each, a valid shortest example made of real payments in the window,
+  and the same per-account counts as cycles expire. Over 32,000 cycles,
+  including ones of 6 payments; with the length limit raised to 12 too.
 - **Against an independent recount in Python**
   (`ml/src/detektive_ml/graph_check.py`): numpy recounts every feature for
   every payment from the raw CSV, with none of the engine's bookkeeping, and
@@ -179,9 +272,22 @@ A new row, "The graph window": payments and accounts in the window, its
 memory, the in-order check per partition (should be 0), payments refused as
 too late (should be 0), how far the watermark trails the newest event, and
 payments in against payments evicted per second. Below it, receiver fan-in
-and sender fan-out at p50, p99 and p99.9.
+and sender fan-out at p50, p99 and p99.9, then payments closing a cycle per
+minute (rings of two apart from longer ones), cycles in the window, cycles
+closed, and cycle searches cut short (should be 0). The consumer also logs
+every payment that closes a cycle, with the ring's accounts.
 
 ## Known gaps
+
+- **Rings out of time order are not found.** 5 of HI-Small's 54 laundering
+  cycles have payments out of order. A plain (non-temporal) cycle search
+  inside the window would find them, at a much higher cost since time no
+  longer prunes the search; the Graph Feature Preprocessor offers both kinds.
+  A candidate for week 9.
+- **A ring is flagged when it closes, not before.** Its earlier payments were
+  already scored by then. `src_cycles` and `dst_cycles` flag the accounts'
+  later payments; raising an alert on the earlier ones after the fact is a
+  job for the alert layer (week 12).
 
 - **Online features see a slightly different window from offline ones.**
   Offline (the `detektive-graph` tool, and training in week 10) the stream is
@@ -213,6 +319,12 @@ and sender fan-out at p50, p99 and p99.9.
 - **Streaming aggregation**: keeping counts incrementally (add on insert,
   subtract on evict) instead of recomputing; which aggregates allow this
   (counts, sums) and which do not (max, distinct counts without per-key state).
+- **Cycle enumeration**: Johnson's algorithm (1975) for all simple cycles of
+  a directed graph, and why it is not used directly here: the engine only
+  needs cycles through one new payment, bounded in length and time. Temporal
+  cycles and time-window pruning (Kumar and Calders' 2SCENT, 2018; Blanuša
+  et al.'s work on temporal and hop-constrained cycles); why bounded
+  enumeration still needs a budget.
 - **Degree distributions**: heavy tails, power laws and how to fit one
   (Clauset, Shalizi and Newman 2009, "Power-law distributions in empirical
   data"); why hubs dominate the cost of naive graph algorithms.
