@@ -290,6 +290,7 @@ name = "detektive-graph"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "detektive-replay",
  "rustc-hash",
