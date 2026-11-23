@@ -91,6 +91,17 @@ time for lateness.
 | `detektive_consumer_end_to_end_latency_seconds` | histogram | Producer to consumer, wall clock |
 | `detektive_consumer_event_lateness_seconds` | histogram | Event-time lateness (0 when in order) |
 | `detektive_consumer_handle_seconds` | histogram | Time to handle one message |
+| `detektive_consumer_watermark_seconds` | gauge | The watermark: the slowest active partition's newest event |
+| `detektive_consumer_behind_partition_total{partition}` | counter | Events older than something their own partition already delivered (expected 0) |
+| `detektive_graph_edges` | gauge | Payments inside the graph window |
+| `detektive_graph_accounts` | gauge | Accounts with a payment inside the window |
+| `detektive_graph_memory_bytes` | gauge | Approximate memory held by the window |
+| `detektive_graph_evicted_total` | counter | Payments evicted after leaving the window |
+| `detektive_graph_too_late_total` | counter | Payments older than the window on arrival, not added |
+| `detektive_graph_receiver_fan_in` | histogram | Receiver's fan-in at each payment |
+| `detektive_graph_sender_fan_out` | histogram | Sender's fan-out at each payment |
+
+What the graph metrics mean: [graph-engine.md](graph-engine.md).
 
 The consumer also serves `/health`, which answers `ok`.
 
@@ -163,5 +174,6 @@ would push it days ahead and close windows on events still to come. The engine
 needs a watermark per partition and takes the slowest one as the stream's
 watermark, as Flink and Kafka Streams do. If each partition is in order, that
 leaves almost nothing late; a small allowance covers the rest, and anything
-later still is counted rather than silently dropped. Week 5 measures
-per-partition order to confirm it.
+later still is counted rather than silently dropped. The graph engine now
+works this way, and counts per-partition order directly to confirm it: see
+[graph-engine.md](graph-engine.md#watermarks).
