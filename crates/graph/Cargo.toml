@@ -5,3 +5,7 @@ description = "Time-windowed payment graph and the features computed on it"
 edition.workspace = true
 license.workspace = true
 
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.9", features = ["derive"] }
+detektive-replay = { path = "../replay" }

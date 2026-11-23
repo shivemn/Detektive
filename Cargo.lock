@@ -287,6 +287,11 @@ dependencies = [
 [[package]]
 name = "detektive-graph"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "detektive-replay",
+]
 
 [[package]]
 name = "detektive-replay"
