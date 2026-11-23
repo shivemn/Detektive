@@ -12,6 +12,14 @@
 //! delivered, and the stream's watermark is the slowest of them. Nothing
 //! older than the watermark should still arrive from an in-order partition.
 //!
+//! A partition assigned to this consumer that has not delivered anything yet
+//! holds the watermark where it is: its first events could be far older than
+//! what the other partitions have sent. Without this, a consumer catching up
+//! on a backlog would read a burst from one partition, move the watermark
+//! days ahead on that partition's clock alone, and then refuse everything
+//! the other partitions bring as too late. `assign` tells it which
+//! partitions to wait for.
+//!
 //! A partition that stops delivering (quiet, or moved to another consumer in
 //! a rebalance) would hold the watermark back forever. After `idle_after` of
 //! wall-clock silence it is left out until it delivers again. That is a
@@ -31,7 +39,9 @@ pub enum Arrival {
 
 #[derive(Debug, Clone)]
 struct PartitionClock {
-    newest: i64,
+    /// `None`: assigned, nothing delivered yet.
+    newest: Option<i64>,
+    /// Last delivery, or the assignment if nothing came yet.
     last_seen: Instant,
     out_of_order: u64,
 }
@@ -52,44 +62,69 @@ impl Watermarks {
         }
     }
 
-    /// Record an event from `partition` with event time `ts`, read at `now`.
-    pub fn observe(&mut self, partition: u32, ts: i64, now: Instant) -> Arrival {
+    /// The partitions this consumer now owns, at `now`. New ones hold the
+    /// watermark until they deliver (or go idle); ones no longer listed stop
+    /// counting.
+    pub fn assign(&mut self, partitions: &[u32], now: Instant) {
+        for (i, clock) in self.partitions.iter_mut().enumerate() {
+            if !partitions.contains(&(i as u32)) {
+                *clock = None;
+            }
+        }
+        for &p in partitions {
+            self.slot(p).get_or_insert(PartitionClock {
+                newest: None,
+                last_seen: now,
+                out_of_order: 0,
+            });
+        }
+    }
+
+    fn slot(&mut self, partition: u32) -> &mut Option<PartitionClock> {
         let i = partition as usize;
         if i >= self.partitions.len() {
             self.partitions.resize(i + 1, None);
         }
-        match &mut self.partitions[i] {
-            None => {
-                self.partitions[i] = Some(PartitionClock {
-                    newest: ts,
-                    last_seen: now,
-                    out_of_order: 0,
-                });
-                Arrival::InOrder
+        &mut self.partitions[i]
+    }
+
+    /// Record an event from `partition` with event time `ts`, read at `now`.
+    pub fn observe(&mut self, partition: u32, ts: i64, now: Instant) -> Arrival {
+        let clock = self.slot(partition).get_or_insert(PartitionClock {
+            newest: None,
+            last_seen: now,
+            out_of_order: 0,
+        });
+        clock.last_seen = now;
+        match clock.newest {
+            Some(newest) if ts < newest => {
+                clock.out_of_order += 1;
+                Arrival::BehindPartition(newest - ts)
             }
-            Some(clock) => {
-                clock.last_seen = now;
-                if ts < clock.newest {
-                    clock.out_of_order += 1;
-                    Arrival::BehindPartition(clock.newest - ts)
-                } else {
-                    clock.newest = ts;
-                    Arrival::InOrder
-                }
+            _ => {
+                clock.newest = Some(ts);
+                Arrival::InOrder
             }
         }
     }
 
     /// Recompute the stream's watermark: the slowest partition that is not
-    /// idle at `now`. If every partition is idle (the stream has stopped),
-    /// all of them count. It never moves backwards.
+    /// idle at `now`. It stays put while an active partition has delivered
+    /// nothing yet. If every partition is idle (the stream has stopped), all
+    /// of them count. It never moves backwards.
     pub fn advance(&mut self, now: Instant) -> Option<i64> {
         let known = || self.partitions.iter().flatten();
-        let active = known()
+        let active: Vec<Option<i64>> = known()
             .filter(|c| now.saturating_duration_since(c.last_seen) < self.idle_after)
             .map(|c| c.newest)
-            .min();
-        let slowest = active.or_else(|| known().map(|c| c.newest).min());
+            .collect();
+        if active.contains(&None) {
+            return self.current;
+        }
+        let slowest = match active.iter().flatten().min() {
+            Some(&t) => Some(t),
+            None => known().filter_map(|c| c.newest).min(),
+        };
         if let Some(w) = slowest {
             self.current = Some(self.current.map_or(w, |c| c.max(w)));
         }
@@ -181,6 +216,46 @@ mod tests {
         assert_eq!(w.observe(0, 70, t0), Arrival::BehindPartition(30));
         assert_eq!(w.observe(1, 5, t0), Arrival::InOrder);
         assert_eq!(w.out_of_order().collect::<Vec<_>>(), vec![(0, 1), (1, 0)]);
+    }
+
+    #[test]
+    fn an_assigned_partition_holds_it_until_it_delivers() {
+        let t0 = Instant::now();
+        let mut w = Watermarks::new(IDLE);
+        w.assign(&[0, 1, 2], t0);
+        // a backlog: partition 0 delivers a burst first
+        w.observe(0, 500, t0);
+        assert_eq!(w.advance(t0), None, "1 and 2 have sent nothing yet");
+        w.observe(1, 100, t0);
+        assert_eq!(w.advance(t0), None);
+        w.observe(2, 300, t0);
+        assert_eq!(w.advance(t0), Some(100));
+    }
+
+    #[test]
+    fn a_silent_assigned_partition_goes_idle_too() {
+        let t0 = Instant::now();
+        let mut w = Watermarks::new(IDLE);
+        w.assign(&[0, 1], t0);
+        w.observe(0, 500, t0);
+        let later = t0 + Duration::from_secs(11);
+        w.observe(0, 600, later);
+        assert_eq!(w.advance(later), Some(600));
+    }
+
+    #[test]
+    fn revoked_partitions_stop_counting() {
+        let t0 = Instant::now();
+        let mut w = Watermarks::new(IDLE);
+        w.observe(0, 50, t0);
+        w.observe(1, 500, t0);
+        assert_eq!(w.advance(t0), Some(50));
+        w.assign(&[1], t0);
+        assert_eq!(w.advance(t0), Some(500));
+        assert_eq!(
+            w.out_of_order().map(|(p, _)| p).collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 
     #[test]
