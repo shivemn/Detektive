@@ -176,7 +176,7 @@ fn run(seed: u64, steps: usize, window: i64, accounts: u32) {
             .filter(|q| q.src == payment.src && q.dst == payment.dst)
             .count();
         assert_eq!(graph.pair_count(payment.src, payment.dst) as usize, pairs);
-        let f = graph.features(&payment);
+        let f = graph.degree_features(&payment);
         assert_eq!(f.src_fan_out, graph.fan_out(payment.src));
         assert_eq!(f.dst_in_degree, graph.in_degree(payment.dst));
 

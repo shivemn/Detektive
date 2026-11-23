@@ -6,12 +6,13 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use detektive_graph::{Features, Payment, Stats, WindowGraph};
+use detektive_graph::{Engine, EngineConfig, Features, Payment, Stats, WindowGraph};
 use detektive_replay::load;
 
-/// Run an IBM AML transactions file through the windowed graph, in time
-/// order: report how big the window gets, how fast it runs and how degrees
-/// are distributed, and optionally write each payment's features.
+/// Run an IBM AML transactions file through the graph engine, in time order:
+/// report how big the window gets, how fast it runs, how degrees are
+/// distributed and what cycles it finds, and optionally write each payment's
+/// features.
 #[derive(Parser)]
 #[command(version)]
 struct Args {
@@ -19,14 +20,22 @@ struct Args {
     input: PathBuf,
 
     /// Window length, in hours of event time
-    #[arg(long, default_value_t = 24.0)]
+    #[arg(long, default_value_t = 96.0)]
     window_hours: f64,
+
+    /// Longest cycle searched for, in payments
+    #[arg(long, default_value_t = 12)]
+    max_cycle_len: usize,
+
+    /// Payments one cycle search may look at before it gives up
+    #[arg(long, default_value_t = 100_000)]
+    cycle_budget: u32,
 
     /// Stop after this many transactions
     #[arg(long)]
     limit: Option<usize>,
 
-    /// Write tx_id and the degree/fan features of every payment to this CSV
+    /// Write tx_id and the features of every payment to this CSV
     #[arg(long)]
     features: Option<PathBuf>,
 }
@@ -59,15 +68,20 @@ fn main() -> Result<()> {
     };
 
     let window = (args.window_hours * 3600.0).round() as i64;
-    let mut graph = WindowGraph::new(window);
+    let mut engine = Engine::new(EngineConfig {
+        window,
+        max_cycle_len: args.max_cycle_len,
+        cycle_budget: args.cycle_budget,
+    });
     let mut peak = Stats::default();
+    let mut cycles = CycleSummary::default();
     let mut degrees = Degrees::default();
     let mut next_snapshot = i64::MIN;
     let mut line = String::new();
     let started = Instant::now();
     for t in &data.transactions[..take] {
         // one stream in time order: the newest event is the watermark
-        graph.advance(t.ts);
+        engine.advance(t.ts);
         let p = Payment {
             tx: t.tx_id,
             ts: t.ts,
@@ -75,8 +89,11 @@ fn main() -> Result<()> {
             dst: t.dst,
             amount: t.amount_paid,
         };
-        graph.insert(p);
-        let features = graph.features(&p);
+        let Some(obs) = engine.add(p) else {
+            continue; // in time order nothing is ever too late
+        };
+        cycles.count(&obs.features, obs.cycles.truncated);
+        let features = obs.features;
         if let Some(w) = out.as_mut() {
             line.clear();
             line.push_str(&t.tx_id.to_string());
@@ -88,7 +105,7 @@ fn main() -> Result<()> {
             w.write_all(line.as_bytes())?;
         }
 
-        let s = graph.stats();
+        let s = engine.graph().stats();
         if s.edges > peak.edges {
             peak = s;
         }
@@ -97,7 +114,7 @@ fn main() -> Result<()> {
         if t.ts >= next_snapshot {
             next_snapshot = t.ts + 3600;
             if s.edges > degrees.edges {
-                degrees = Degrees::of(&graph, t.ts);
+                degrees = Degrees::of(engine.graph(), t.ts);
             }
         }
     }
@@ -106,7 +123,7 @@ fn main() -> Result<()> {
     }
     let elapsed = started.elapsed().as_secs_f64();
 
-    let end = graph.stats();
+    let end = engine.graph().stats();
     eprintln!(
         "{take} payments through a {}h window in {elapsed:.2}s ({:.0}/s{})",
         args.window_hours,
@@ -128,11 +145,57 @@ fn main() -> Result<()> {
         "at the end: {} edges, {} accounts; {} evicted, {} refused as too late",
         end.edges, end.accounts, end.evicted, end.too_late
     );
+    cycles.report(args.max_cycle_len);
     degrees.report();
     if let Some(path) = &args.features {
         eprintln!("features written to {}", path.display());
     }
     Ok(())
+}
+
+/// What the cycle search found over the whole run.
+#[derive(Default)]
+struct CycleSummary {
+    payments: u64,
+    cycles: u64,
+    truncated: u64,
+    /// payments closing a cycle, by the length of the shortest one
+    by_length: Vec<u64>,
+}
+
+impl CycleSummary {
+    fn count(&mut self, f: &Features, truncated: bool) {
+        if truncated {
+            self.truncated += 1;
+        }
+        if f.cycles == 0 {
+            return;
+        }
+        self.payments += 1;
+        self.cycles += u64::from(f.cycles);
+        let len = f.shortest_cycle as usize;
+        if len >= self.by_length.len() {
+            self.by_length.resize(len + 1, 0);
+        }
+        self.by_length[len] += 1;
+    }
+
+    fn report(&self, max_len: usize) {
+        eprintln!(
+            "\ncycles of 2 to {max_len} payments: {} payments closed {} cycles; {} searches stopped at the budget",
+            self.payments, self.cycles, self.truncated
+        );
+        let shown: Vec<String> = self
+            .by_length
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(len, n)| format!("{len}: {n}"))
+            .collect();
+        if !shown.is_empty() {
+            eprintln!("  payments by their shortest cycle: {}", shown.join(" | "));
+        }
+    }
 }
 
 /// Fan-in and fan-out of every account in the window at one moment.

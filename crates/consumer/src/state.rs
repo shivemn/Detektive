@@ -150,7 +150,7 @@ impl State {
             lateness,
             behind_partition,
             too_late: inserted == Insert::TooLate,
-            features: (inserted == Insert::Added).then(|| self.graph.features(&payment)),
+            features: (inserted == Insert::Added).then(|| self.graph.degree_features(&payment)),
         }
     }
 

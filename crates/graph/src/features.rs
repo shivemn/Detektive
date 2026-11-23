@@ -16,8 +16,17 @@
 //! (pair count 1) are the shapes the model will look for in these numbers.
 //!
 //! Degree and fan are the simplest graph features, and the ones the Graph
-//! Feature Preprocessor paper (Blanuša et al., 2024) starts from. Cycles and
-//! scatter-gather come in weeks 7 and 8.
+//! Feature Preprocessor paper (Blanuša et al., 2024) starts from.
+//!
+//! Then the cycle features (filled in by `Engine`, see `cycles.rs`):
+//!
+//! - cycles: how many distinct temporal cycles this payment closes;
+//! - shortest cycle: payments in the shortest of them (0 if none);
+//! - sender's and receiver's cycles: cycles found inside the window that the
+//!   account is part of, this payment's included. A cycle is found when its
+//!   last payment arrives, after its earlier payments were already scored;
+//!   these two carry the finding forward to every later payment of the
+//!   accounts in the ring.
 
 use crate::graph::{Payment, WindowGraph};
 
@@ -32,11 +41,15 @@ pub struct Features {
     pub dst_out_degree: u32,
     pub dst_fan_out: u32,
     pub pair_count: u32,
+    pub cycles: u32,
+    pub shortest_cycle: u32,
+    pub src_cycles: u32,
+    pub dst_cycles: u32,
 }
 
 impl Features {
     /// Column names, in the order of `values`.
-    pub const NAMES: [&'static str; 9] = [
+    pub const NAMES: [&'static str; 13] = [
         "src_out_degree",
         "src_fan_out",
         "src_in_degree",
@@ -46,9 +59,13 @@ impl Features {
         "dst_out_degree",
         "dst_fan_out",
         "pair_count",
+        "cycles",
+        "shortest_cycle",
+        "src_cycles",
+        "dst_cycles",
     ];
 
-    pub fn values(&self) -> [u32; 9] {
+    pub fn values(&self) -> [u32; 13] {
         [
             self.src_out_degree,
             self.src_fan_out,
@@ -59,15 +76,19 @@ impl Features {
             self.dst_out_degree,
             self.dst_fan_out,
             self.pair_count,
+            self.cycles,
+            self.shortest_cycle,
+            self.src_cycles,
+            self.dst_cycles,
         ]
     }
 }
 
 impl WindowGraph {
-    /// Features of `p` as the window stands now. Call right after inserting
-    /// `p`. Nine lookups, whatever the size of either account's
-    /// neighbourhood.
-    pub fn features(&self, p: &Payment) -> Features {
+    /// The degree and fan features of `p` as the window stands now (cycle
+    /// features left at 0). Call right after inserting `p`. Nine lookups,
+    /// whatever the size of either account's neighbourhood.
+    pub fn degree_features(&self, p: &Payment) -> Features {
         Features {
             src_out_degree: self.out_degree(p.src),
             src_fan_out: self.fan_out(p.src),
@@ -78,6 +99,7 @@ impl WindowGraph {
             dst_out_degree: self.out_degree(p.dst),
             dst_fan_out: self.fan_out(p.dst),
             pair_count: self.pair_count(p.src, p.dst),
+            ..Features::default()
         }
     }
 }
@@ -107,7 +129,7 @@ mod tests {
         }
         let out = pay(tx, 200, 9, 20);
         g.insert(out);
-        let f = g.features(&out);
+        let f = g.degree_features(&out);
         assert_eq!(
             f,
             Features {
@@ -120,6 +142,7 @@ mod tests {
                 dst_out_degree: 0,
                 dst_fan_out: 0,
                 pair_count: 1,
+                ..Features::default()
             }
         );
     }
@@ -136,8 +159,12 @@ mod tests {
             dst_out_degree: 7,
             dst_fan_out: 8,
             pair_count: 9,
+            cycles: 10,
+            shortest_cycle: 11,
+            src_cycles: 12,
+            dst_cycles: 13,
         };
-        assert_eq!(f.values(), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(f.values(), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
         assert_eq!(Features::NAMES.len(), f.values().len());
     }
 }
