@@ -38,6 +38,22 @@ processed_on_consumer() {
     curl -fsS localhost:$METRICS_PORT/metrics | grep -qx "detektive_consumer_messages_total{outcome=\"processed\"} $ROWS"
 }
 
+# every payment is in the graph window or was evicted from it, none was
+# refused as too late, and every partition arrived in order
+graph_kept_every_payment() {
+    curl -fsS localhost:$METRICS_PORT/metrics | python3 -c "
+import sys
+m = {}
+for line in sys.stdin:
+    if not line.startswith('#'):
+        name, value = line.rsplit(' ', 1)
+        m[name] = float(value)
+behind = sum(v for k, v in m.items() if k.startswith('detektive_consumer_behind_partition_total'))
+ok = (m['detektive_graph_edges'] + m['detektive_graph_evicted_total'] == $ROWS
+      and m['detektive_graph_too_late_total'] == 0 and behind == 0)
+sys.exit(0 if ok else 1)"
+}
+
 # exactly one consumer target up: two would mean the same consumer is
 # scraped twice and every sum on the dashboard is doubled
 one_consumer_target_up() {
@@ -80,6 +96,7 @@ DETEKTIVE_DATA_DIR=$SAMPLE_DIR docker compose run --rm replay --speed max
 
 log "following the count through every hop"
 wait_for "consumer handled all $ROWS ($GROUP_HINT)" 90 processed_on_consumer
+wait_for "the graph window accounts for every payment" 10 graph_kept_every_payment
 wait_for "Prometheus scrapes exactly one consumer" 30 one_consumer_target_up
 wait_for "Prometheus scraped the same count" 60 processed_in_prometheus
 wait_for "Grafana loaded the dashboard" 60 grafana_has_dashboard
