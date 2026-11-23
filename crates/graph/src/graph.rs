@@ -12,6 +12,12 @@
 //! A separate expiry index, ordered by time, says which edges leave the
 //! window next.
 //!
+//! Each account also keeps a running count of payments per counterparty, in
+//! each direction, updated as payments enter and leave the window. Fan-in and
+//! fan-out (how many distinct accounts) and the number of payments between a
+//! pair are then single lookups instead of scans of the neighbourhood: the
+//! features in `features.rs` cost the same for a hub as for anyone else.
+//!
 //! Eviction pops from the front of each adjacency list. Payments mostly
 //! arrive in time order, so the oldest edge is almost always at the front.
 //! A late payment can sit behind a newer one; it then lingers in the list
@@ -20,6 +26,8 @@
 //! and every read filters by the window, so a lingering edge is never seen.
 
 use std::collections::{BTreeMap, VecDeque};
+
+use rustc_hash::FxHashMap;
 
 /// A payment as the graph needs it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -59,12 +67,19 @@ pub struct Stats {
     /// Adjacency entries held, including late edges still lingering after
     /// leaving the window. Twice `edges` when nothing lingers.
     pub stored: usize,
+    /// Distinct (account, counterparty) pairs counted, both directions.
+    pub pairs: usize,
 }
 
 impl Stats {
     /// Rough memory held by the edges, in bytes.
     pub fn approx_bytes(&self) -> usize {
-        self.stored * std::mem::size_of::<Half>() + self.edges * std::mem::size_of::<(u32, u32)>()
+        // a hash map entry: key, count and about one control byte, at the
+        // map's typical 7/8 load
+        const PAIR: usize = (4 + 4 + 1) * 8 / 7;
+        self.stored * std::mem::size_of::<Half>()
+            + self.edges * std::mem::size_of::<(u32, u32)>()
+            + self.pairs * PAIR
     }
 }
 
@@ -74,6 +89,9 @@ struct Node {
     inc: VecDeque<Half>,
     out_live: u32,
     in_live: u32,
+    /// Payments inside the window, per account paid / account paid by.
+    out_peers: FxHashMap<u32, u32>,
+    in_peers: FxHashMap<u32, u32>,
 }
 
 impl Node {
@@ -151,11 +169,13 @@ impl WindowGraph {
         let node = &mut self.nodes[src as usize];
         node.out_live -= 1;
         self.stats.stored -= pop_expired(&mut node.out, cutoff);
+        self.stats.pairs -= uncount(&mut node.out_peers, dst);
         self.release_if_empty(src);
 
         let node = &mut self.nodes[dst as usize];
         node.in_live -= 1;
         self.stats.stored -= pop_expired(&mut node.inc, cutoff);
+        self.stats.pairs -= uncount(&mut node.in_peers, src);
         self.release_if_empty(dst);
     }
 
@@ -168,7 +188,10 @@ impl WindowGraph {
         // with no live edge left, everything it held was older than the
         // cutoff, so the lists are already empty
         debug_assert!(node.out.is_empty() && node.inc.is_empty());
-        if node.out.capacity() > 0 || node.inc.capacity() > 0 {
+        debug_assert!(node.out_peers.is_empty() && node.in_peers.is_empty());
+        if node.out.capacity() + node.inc.capacity() > 0
+            || node.out_peers.capacity() + node.in_peers.capacity() > 0
+        {
             *node = Node::default();
         }
         self.stats.accounts -= 1;
@@ -195,6 +218,7 @@ impl WindowGraph {
             amount: p.amount,
         });
         src.out_live += 1;
+        self.stats.pairs += count(&mut src.out_peers, p.dst);
         if !was_live {
             self.stats.accounts += 1;
         }
@@ -209,6 +233,7 @@ impl WindowGraph {
             amount: p.amount,
         });
         dst.in_live += 1;
+        self.stats.pairs += count(&mut dst.in_peers, p.src);
         if !was_live {
             self.stats.accounts += 1;
         }
@@ -248,6 +273,59 @@ impl WindowGraph {
     /// peer.
     pub fn in_degree(&self, account: u32) -> u32 {
         self.nodes.get(account as usize).map_or(0, |n| n.in_live)
+    }
+
+    /// Distinct accounts `account` paid inside the window.
+    pub fn fan_out(&self, account: u32) -> u32 {
+        self.nodes
+            .get(account as usize)
+            .map_or(0, |n| n.out_peers.len() as u32)
+    }
+
+    /// Distinct accounts that paid `account` inside the window.
+    pub fn fan_in(&self, account: u32) -> u32 {
+        self.nodes
+            .get(account as usize)
+            .map_or(0, |n| n.in_peers.len() as u32)
+    }
+
+    /// Payments from `src` to `dst` inside the window.
+    pub fn pair_count(&self, src: u32, dst: u32) -> u32 {
+        self.nodes
+            .get(src as usize)
+            .and_then(|n| n.out_peers.get(&dst))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Accounts with at least one payment inside the window.
+    pub fn accounts(&self) -> impl Iterator<Item = u32> + '_ {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.is_live())
+            .map(|(i, _)| i as u32)
+    }
+}
+
+/// Count one more payment with `peer`; returns 1 if the pair is new.
+fn count(peers: &mut FxHashMap<u32, u32>, peer: u32) -> usize {
+    let n = peers.entry(peer).or_insert(0);
+    *n += 1;
+    usize::from(*n == 1)
+}
+
+/// Count one payment with `peer` less; returns 1 if the pair is now gone.
+fn uncount(peers: &mut FxHashMap<u32, u32>, peer: u32) -> usize {
+    let n = peers
+        .get_mut(&peer)
+        .expect("evicting a payment that was counted");
+    *n -= 1;
+    if *n == 0 {
+        peers.remove(&peer);
+        1
+    } else {
+        0
     }
 }
 
@@ -361,6 +439,40 @@ mod tests {
         g.advance(500);
         g.advance(300);
         assert_eq!(g.cutoff(), Some(400));
+    }
+
+    #[test]
+    fn counts_distinct_counterparties_and_repeats() {
+        let mut g = WindowGraph::new(100);
+        g.insert(pay(0, 10, 1, 2));
+        g.insert(pay(1, 20, 1, 2));
+        g.insert(pay(2, 30, 1, 3));
+        g.insert(pay(3, 40, 4, 2));
+        assert_eq!((g.out_degree(1), g.fan_out(1)), (3, 2));
+        assert_eq!((g.in_degree(2), g.fan_in(2)), (3, 2));
+        assert_eq!(g.pair_count(1, 2), 2);
+        assert_eq!(g.pair_count(2, 1), 0);
+        assert_eq!(
+            g.stats().pairs,
+            6,
+            "1-2, 1-3, 4-2, each counted at both ends"
+        );
+
+        g.advance(115); // cutoff 15: tx 0 goes, 1->2 is still paid once
+        assert_eq!((g.fan_out(1), g.pair_count(1, 2)), (2, 1));
+        g.advance(125); // tx 1 goes too: 1 no longer pays 2
+        assert_eq!((g.fan_out(1), g.pair_count(1, 2)), (1, 0));
+        assert_eq!(g.fan_in(2), 1);
+        assert_eq!(g.stats().pairs, 4);
+    }
+
+    #[test]
+    fn lists_the_accounts_in_the_window() {
+        let mut g = WindowGraph::new(100);
+        g.insert(pay(0, 10, 5, 2));
+        g.insert(pay(1, 90, 7, 7));
+        g.advance(150);
+        assert_eq!(g.accounts().collect::<Vec<_>>(), vec![7]);
     }
 
     #[test]

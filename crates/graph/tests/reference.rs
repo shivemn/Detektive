@@ -144,7 +144,42 @@ fn run(seed: u64, steps: usize, window: i64, accounts: u32) {
                 sorted(graph.in_edges(a).map(|h| h.tx).collect()),
                 sorted(inc)
             );
+            let distinct = |v: Vec<u32>| {
+                let mut v = v;
+                v.sort_unstable();
+                v.dedup();
+                v.len() as u32
+            };
+            let paid: Vec<u32> = reference
+                .live(cutoff)
+                .filter(|q| q.src == a)
+                .map(|q| q.dst)
+                .collect();
+            let paid_by: Vec<u32> = reference
+                .live(cutoff)
+                .filter(|q| q.dst == a)
+                .map(|q| q.src)
+                .collect();
+            assert_eq!(
+                graph.fan_out(a),
+                distinct(paid),
+                "fan-out of {a} at step {step}"
+            );
+            assert_eq!(
+                graph.fan_in(a),
+                distinct(paid_by),
+                "fan-in of {a} at step {step}"
+            );
         }
+        let pairs = reference
+            .live(cutoff)
+            .filter(|q| q.src == payment.src && q.dst == payment.dst)
+            .count();
+        assert_eq!(graph.pair_count(payment.src, payment.dst) as usize, pairs);
+        let f = graph.features(&payment);
+        assert_eq!(f.src_fan_out, graph.fan_out(payment.src));
+        assert_eq!(f.dst_in_degree, graph.in_degree(payment.dst));
+
         let live: Vec<&Payment> = reference.live(cutoff).collect();
         let stats = graph.stats();
         assert_eq!(stats.edges, live.len(), "live edges at step {step}");
@@ -157,6 +192,10 @@ fn run(seed: u64, steps: usize, window: i64, accounts: u32) {
             "active accounts at step {step}"
         );
         assert!(stats.stored >= 2 * stats.edges);
+        let mut pairs: Vec<(u32, u32)> = live.iter().map(|q| (q.src, q.dst)).collect();
+        pairs.sort_unstable();
+        pairs.dedup();
+        assert_eq!(stats.pairs, 2 * pairs.len(), "pairs at step {step}");
     }
     let s = graph.stats();
     // the stream must actually exercise eviction and refusal
@@ -194,6 +233,6 @@ fn memory_is_released_once_the_stream_moves_on() {
     // a day later nothing is left
     g.advance(10_000 + 86_400);
     let s = g.stats();
-    assert_eq!((s.edges, s.accounts, s.stored), (0, 0, 0));
+    assert_eq!((s.edges, s.accounts, s.stored, s.pairs), (0, 0, 0, 0));
     assert_eq!(s.evicted, 10_000);
 }
