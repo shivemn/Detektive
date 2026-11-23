@@ -1,0 +1,7 @@
+[package]
+name = "detektive-graph"
+version = "0.1.0"
+description = "Time-windowed payment graph and the features computed on it"
+edition.workspace = true
+license.workspace = true
+
