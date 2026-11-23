@@ -168,11 +168,11 @@ pub async fn run(
                     state.assign(&partitions, last_message);
                 }
                 let partition = u32::try_from(message.partition()).unwrap_or(0);
-                let before = state.graph.stats();
+                let before = state.graph().stats();
                 let outcome = state.handle(partition, message.payload(), last_message);
                 metrics.handle_time.observe(last_message.elapsed().as_secs_f64());
                 match outcome {
-                    Outcome::Processed { lateness, behind_partition, features, .. } => {
+                    Outcome::Processed { lateness, behind_partition, observation, .. } => {
                         metrics.messages.with_label_values(&["processed"]).inc();
                         metrics.event_lateness.observe(lateness as f64);
                         if lateness > 0 {
@@ -181,9 +181,24 @@ pub async fn run(
                         if behind_partition > 0 {
                             metrics.behind_partition.with_label_values(&[&partition.to_string()]).inc();
                         }
-                        if let Some(f) = features {
+                        if let Some(o) = observation {
+                            let f = o.features;
                             metrics.receiver_fan_in.observe(f64::from(f.dst_fan_in));
                             metrics.sender_fan_out.observe(f64::from(f.src_fan_out));
+                            if o.cycles.truncated {
+                                metrics.cycle_truncated.inc();
+                            }
+                            if f.cycles > 0 {
+                                metrics.cycles.inc_by(u64::from(f.cycles));
+                                metrics.shortest_cycle.observe(f64::from(f.shortest_cycle));
+                                info!(
+                                    tx = o.cycles.example.last().map(|h| h.tx),
+                                    cycles = f.cycles,
+                                    shortest = f.shortest_cycle,
+                                    ring = ?o.cycles.example.iter().map(|h| h.src).collect::<Vec<_>>(),
+                                    "payment closes a cycle"
+                                );
+                            }
                         }
                         record_graph(&metrics, &state, before);
                     }
@@ -218,7 +233,7 @@ pub async fn run(
     consumer.unsubscribe();
     progress.log(&state);
 
-    let graph = state.graph.stats();
+    let graph = state.graph().stats();
     Ok(Summary {
         behind_partition: state.behind_partition(),
         window_edges: graph.edges,
@@ -240,7 +255,7 @@ pub async fn run(
 /// Update the graph metrics after a payment went in. `before` is the graph
 /// as it was just before, so the counters move by exactly what changed.
 fn record_graph(metrics: &Metrics, state: &State, before: detektive_graph::Stats) {
-    let after = state.graph.stats();
+    let after = state.graph().stats();
     metrics.graph_edges.set(after.edges as i64);
     metrics.graph_accounts.set(after.accounts as i64);
     metrics.graph_bytes.set(after.approx_bytes() as i64);
@@ -248,6 +263,7 @@ fn record_graph(metrics: &Metrics, state: &State, before: detektive_graph::Stats
     metrics
         .graph_too_late
         .inc_by(after.too_late - before.too_late);
+    metrics.live_cycles.set(state.engine.live_cycles() as i64);
     if let Some(w) = state.watermarks.current() {
         metrics.watermark.set(w);
     }
@@ -337,7 +353,7 @@ impl Progress {
             bad = state.bad,
             out_of_order = state.out_of_order,
             behind_partition = state.behind_partition(),
-            window_edges = state.graph.stats().edges,
+            window_edges = state.graph().stats().edges,
             accounts = state.accounts(),
             rate = format!("{rate:.0}/s"),
             "progress"

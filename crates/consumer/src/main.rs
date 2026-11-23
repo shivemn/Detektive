@@ -45,9 +45,17 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:9899")]
     metrics_addr: String,
 
-    /// Hours of event time the payment graph keeps
-    #[arg(long, default_value_t = 24.0)]
+    /// Hours of event time the payment graph keeps; cycles must fit inside
+    #[arg(long, default_value_t = 96.0)]
     window_hours: f64,
+
+    /// Longest cycle searched for, in payments
+    #[arg(long, default_value_t = 12)]
+    max_cycle_len: usize,
+
+    /// Payments one cycle search may look at before it gives up
+    #[arg(long, default_value_t = 100_000)]
+    cycle_budget: u32,
 
     /// Seconds of silence after which a partition stops holding the
     /// watermark back
@@ -74,6 +82,8 @@ async fn main() -> Result<()> {
         report_every: Duration::from_secs(args.report_secs),
         graph: GraphSettings {
             window: Duration::from_secs_f64(args.window_hours * 3600.0),
+            max_cycle_len: args.max_cycle_len,
+            cycle_budget: args.cycle_budget,
             idle_partition: Duration::from_secs(args.idle_partition_secs),
         },
     };

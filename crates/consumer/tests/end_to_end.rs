@@ -13,7 +13,7 @@ use rdkafka::mocking::MockCluster;
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 
 use detektive_consumer::metrics::Metrics;
-use detektive_consumer::{Config, Summary, run};
+use detektive_consumer::{Config, GraphSettings, Summary, run};
 use detektive_replay::event::EventOptions;
 use detektive_replay::kafka::KafkaSink;
 use detektive_replay::model::{Currency, PaymentFormat, Transaction};
@@ -104,6 +104,10 @@ async fn every_replayed_event_arrives_exactly_once() {
 
     let summary = consume(Config {
         stop_after: Some(3_000),
+        graph: GraphSettings {
+            window: Duration::from_secs(24 * 3600),
+            ..GraphSettings::default()
+        },
         ..config(&brokers, "once")
     })
     .await;
@@ -356,6 +360,10 @@ async fn metrics_endpoint_reports_what_the_consumer_did() {
         500.0
     );
     assert_eq!(metric(&text, "detektive_graph_sender_fan_out_count"), 500.0);
+    assert_eq!(
+        metric(&text, "detektive_graph_cycle_search_truncated_total"),
+        0.0
+    );
     let watermark = metric(&text, "detektive_consumer_watermark_seconds");
     assert!(watermark >= 1_661_990_400.0 && watermark <= (1_661_990_400 + 499 * 60) as f64);
     // everything was read, so every partition's lag is 0

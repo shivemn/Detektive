@@ -58,6 +58,10 @@ pub struct Metrics {
     pub graph_too_late: IntCounter,
     pub receiver_fan_in: Histogram,
     pub sender_fan_out: Histogram,
+    pub cycles: IntCounter,
+    pub shortest_cycle: Histogram,
+    pub cycle_truncated: IntCounter,
+    pub live_cycles: IntGauge,
 }
 
 impl Metrics {
@@ -165,6 +169,25 @@ impl Metrics {
                 )
                 .buckets(FAN_BUCKETS.to_vec()),
             )?,
+            cycles: IntCounter::new(
+                "detektive_graph_cycles_total",
+                "Temporal cycles closed by payments (distinct account sequences)",
+            )?,
+            shortest_cycle: Histogram::with_opts(
+                HistogramOpts::new(
+                    "detektive_graph_shortest_cycle",
+                    "Payments in the shortest cycle, for each payment that closes one",
+                )
+                .buckets((2..=12).map(f64::from).collect()),
+            )?,
+            cycle_truncated: IntCounter::new(
+                "detektive_graph_cycle_search_truncated_total",
+                "Cycle searches stopped at their budget (there may have been more cycles)",
+            )?,
+            live_cycles: IntGauge::new(
+                "detektive_graph_live_cycles",
+                "Cycles found whose payments are all still inside the window",
+            )?,
             registry,
         };
         m.registry.register(Box::new(m.messages.clone()))?;
@@ -186,6 +209,10 @@ impl Metrics {
         m.registry.register(Box::new(m.graph_too_late.clone()))?;
         m.registry.register(Box::new(m.receiver_fan_in.clone()))?;
         m.registry.register(Box::new(m.sender_fan_out.clone()))?;
+        m.registry.register(Box::new(m.cycles.clone()))?;
+        m.registry.register(Box::new(m.shortest_cycle.clone()))?;
+        m.registry.register(Box::new(m.cycle_truncated.clone()))?;
+        m.registry.register(Box::new(m.live_cycles.clone()))?;
         // make every outcome visible from the start, at 0
         for outcome in ["processed", "duplicate", "bad"] {
             m.messages.with_label_values(&[outcome]);
@@ -310,6 +337,9 @@ mod tests {
             "detektive_graph_edges 0",
             "detektive_graph_evicted_total 0",
             "detektive_graph_too_late_total 0",
+            "detektive_graph_cycles_total 0",
+            "detektive_graph_live_cycles 0",
+            "detektive_graph_shortest_cycle_bucket",
         ] {
             assert!(text.contains(name), "missing {name} in\n{text}");
         }

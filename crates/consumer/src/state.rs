@@ -12,7 +12,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use detektive_graph::{Arrival, Features, Insert, Payment, Watermarks, WindowGraph};
+use detektive_graph::{
+    Arrival, Engine, EngineConfig, Observation, Payment, Watermarks, WindowGraph,
+};
 
 use crate::bitset::BitSet;
 use crate::event::{DecodeError, decode};
@@ -28,26 +30,33 @@ pub enum Outcome {
         behind_partition: i64,
         /// Already older than the graph window, so not added to it.
         too_late: bool,
-        /// Degree and fan features of the payment, read from the window
-        /// right after it went in. `None` if it was too late to go in.
-        features: Option<Features>,
+        /// The payment's features and the cycles it closes, read from the
+        /// window right after it went in. `None` if it was too late to go in.
+        observation: Option<Observation>,
     },
     Duplicate,
     Bad(DecodeError),
 }
 
-/// How much event time the graph keeps, and when a silent partition stops
-/// holding the watermark back.
+/// How much event time the graph keeps, how far cycle searches go, and when
+/// a silent partition stops holding the watermark back.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GraphSettings {
     pub window: Duration,
+    pub max_cycle_len: usize,
+    pub cycle_budget: u32,
     pub idle_partition: Duration,
 }
 
 impl Default for GraphSettings {
+    /// The engine's defaults (four days, cycles of up to twelve payments; see
+    /// `EngineConfig`), and 10 s of silence before a partition counts as idle.
     fn default() -> Self {
+        let engine = EngineConfig::default();
         Self {
-            window: Duration::from_secs(24 * 3600),
+            window: Duration::from_secs(engine.window as u64),
+            max_cycle_len: engine.max_cycle_len,
+            cycle_budget: engine.cycle_budget,
             idle_partition: Duration::from_secs(10),
         }
     }
@@ -69,7 +78,7 @@ pub struct State {
     pub max_lateness: i64,
     pub by_format: BTreeMap<String, u64>,
     pub watermarks: Watermarks,
-    pub graph: WindowGraph,
+    pub engine: Engine,
 }
 
 impl Default for State {
@@ -91,7 +100,11 @@ impl State {
             max_lateness: 0,
             by_format: BTreeMap::new(),
             watermarks: Watermarks::new(settings.idle_partition),
-            graph: WindowGraph::new(settings.window.as_secs() as i64),
+            engine: Engine::new(EngineConfig {
+                window: settings.window.as_secs() as i64,
+                max_cycle_len: settings.max_cycle_len,
+                cycle_budget: settings.cycle_budget,
+            }),
         }
     }
 
@@ -136,7 +149,7 @@ impl State {
             Arrival::BehindPartition(secs) => secs,
         };
         if let Some(w) = self.watermarks.advance(now) {
-            self.graph.advance(w);
+            self.engine.advance(w);
         }
         let payment = Payment {
             tx: event.tx_id,
@@ -145,13 +158,17 @@ impl State {
             dst: event.dst,
             amount: event.amount,
         };
-        let inserted = self.graph.insert(payment);
+        let observation = self.engine.add(payment);
         Outcome::Processed {
             lateness,
             behind_partition,
-            too_late: inserted == Insert::TooLate,
-            features: (inserted == Insert::Added).then(|| self.graph.degree_features(&payment)),
+            too_late: observation.is_none(),
+            observation,
         }
+    }
+
+    pub fn graph(&self) -> &WindowGraph {
+        self.engine.graph()
     }
 
     /// The partitions this consumer now owns (after a rebalance).
@@ -191,7 +208,7 @@ mod tests {
             lateness,
             behind_partition: 0,
             too_late: false,
-            features: None,
+            observation: None,
         }
     }
 
@@ -207,7 +224,7 @@ mod tests {
                 lateness,
                 behind_partition,
                 too_late,
-                features: None,
+                observation: None,
             },
             other => other,
         }
@@ -244,7 +261,7 @@ mod tests {
         assert_eq!(handle(&mut s, Some(&e)), in_order(0));
         assert_eq!(handle(&mut s, Some(&e)), Outcome::Duplicate);
         assert_eq!((s.processed, s.duplicates), (1, 1));
-        assert_eq!(s.graph.stats().edges, 1, "a repeat is not a second edge");
+        assert_eq!(s.graph().stats().edges, 1, "a repeat is not a second edge");
     }
 
     #[test]
@@ -277,7 +294,7 @@ mod tests {
                 lateness: 60,
                 behind_partition: 60,
                 too_late: false,
-                features: None,
+                observation: None,
             }
         );
         assert_eq!(s.behind_partition(), 1);
@@ -288,7 +305,7 @@ mod tests {
         let hour = 3600;
         let mut s = State::new(GraphSettings {
             window: Duration::from_secs(hour as u64),
-            idle_partition: Duration::from_secs(10),
+            ..GraphSettings::default()
         });
         let now = Instant::now();
         s.handle(0, Some(&event(0, 0, 1, 2, "ach")), now);
@@ -296,24 +313,24 @@ mod tests {
         // partition 0 races three hours ahead; partition 1 is still at 0,
         // so nothing may be evicted yet
         s.handle(0, Some(&event(2, 3 * hour, 5, 6, "ach")), now);
-        assert_eq!(s.graph.stats().edges, 3);
+        assert_eq!(s.graph().stats().edges, 3);
         // partition 1 catches up: now the first two leave the window
         s.handle(1, Some(&event(3, 3 * hour, 7, 8, "ach")), now);
-        assert_eq!(s.graph.stats().edges, 2);
-        assert_eq!(s.graph.stats().evicted, 2);
+        assert_eq!(s.graph().stats().edges, 2);
+        assert_eq!(s.graph().stats().evicted, 2);
     }
 
     #[test]
     fn payments_older_than_the_window_are_not_added() {
         let mut s = State::new(GraphSettings {
             window: Duration::from_secs(60),
-            idle_partition: Duration::from_secs(10),
+            ..GraphSettings::default()
         });
         let now = Instant::now();
         s.handle(0, Some(&event(0, 1000, 1, 2, "ach")), now);
         let outcome = s.handle(1, Some(&event(1, 900, 1, 2, "ach")), now);
         assert!(matches!(outcome, Outcome::Processed { too_late: true, .. }));
-        assert_eq!(s.graph.stats().edges, 1);
+        assert_eq!(s.graph().stats().edges, 1);
     }
 
     #[test]
@@ -323,12 +340,31 @@ mod tests {
         s.handle(0, Some(&event(0, 10, 1, 9, "ach")), now);
         s.handle(0, Some(&event(1, 20, 2, 9, "ach")), now);
         let Outcome::Processed {
-            features: Some(f), ..
+            observation: Some(o),
+            ..
         } = s.handle(0, Some(&event(2, 30, 9, 5, "wire")), now)
         else {
             panic!("expected features");
         };
+        let f = o.features;
         assert_eq!((f.src_fan_in, f.src_out_degree, f.pair_count), (2, 1, 1));
+    }
+
+    #[test]
+    fn a_payment_that_closes_a_ring_says_so() {
+        let mut s = State::default();
+        let now = Instant::now();
+        s.handle(0, Some(&event(0, 10, 1, 2, "ach")), now);
+        s.handle(0, Some(&event(1, 20, 2, 3, "ach")), now);
+        let Outcome::Processed {
+            observation: Some(o),
+            ..
+        } = s.handle(0, Some(&event(2, 30, 3, 1, "ach")), now)
+        else {
+            panic!("expected an observation");
+        };
+        assert_eq!((o.features.cycles, o.features.shortest_cycle), (1, 3));
+        assert_eq!(o.cycles.example.len(), 3);
     }
 
     #[test]
