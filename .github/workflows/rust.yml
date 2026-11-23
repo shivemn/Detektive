@@ -2,9 +2,9 @@ name: rust
 
 on:
   push:
-    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml", "ml/tests/fixtures/**", "observability/grafana/dashboards/**"]
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml", "ml/tests/fixtures/**", "observability/grafana/dashboards/**", "ml/src/detektive_ml/graph_check.py", "scripts/check_features.sh"]
   pull_request:
-    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml", "ml/tests/fixtures/**", "observability/grafana/dashboards/**"]
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml", "ml/tests/fixtures/**", "observability/grafana/dashboards/**", "ml/src/detektive_ml/graph_check.py", "scripts/check_features.sh"]
   workflow_dispatch:
 
 env:
@@ -27,3 +27,18 @@ jobs:
       - run: cargo clippy -p detektive-replay --all-targets -- -D warnings
       # end-to-end tests use librdkafka's in-process mock cluster: no Docker needed
       - run: cargo test --workspace --all-features
+
+  # the engine's features against a brute-force recount in Python
+  features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: ml/pyproject.toml
+      - run: pip install -e ml
+      - run: bash scripts/check_features.sh
