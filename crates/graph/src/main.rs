@@ -80,6 +80,7 @@ fn main() -> Result<()> {
     });
     let mut peak = Stats::default();
     let mut cycles = CycleSummary::default();
+    let mut fans = FanSummary::default();
     let mut degrees = Degrees::default();
     let mut next_snapshot = i64::MIN;
     let mut line = String::new();
@@ -99,6 +100,7 @@ fn main() -> Result<()> {
             continue; // in time order nothing is ever too late
         };
         cycles.count(&obs.features, obs.cycles.truncated);
+        fans.count(obs.features.scatter_gather, obs.scatter_gather.truncated);
         let features = obs.features;
         if let Some(w) = out.as_mut() {
             line.clear();
@@ -152,6 +154,7 @@ fn main() -> Result<()> {
         end.edges, end.accounts, end.evicted, end.too_late
     );
     cycles.report(args.max_cycle_len);
+    fans.report();
     degrees.report();
     if let Some(path) = &args.features {
         eprintln!("features written to {}", path.display());
@@ -201,6 +204,42 @@ impl CycleSummary {
         if !shown.is_empty() {
             eprintln!("  payments by their shortest cycle: {}", shown.join(" | "));
         }
+    }
+}
+
+/// Payments by the width of the widest scatter-gather they are part of.
+#[derive(Default)]
+struct FanSummary {
+    /// widths 0, 1, 2, 3-4, 5-9, 10+
+    bands: [u64; 6],
+    truncated: u64,
+}
+
+impl FanSummary {
+    const LABELS: [&'static str; 6] = ["none", "1", "2", "3-4", "5-9", "10+"];
+
+    fn count(&mut self, width: u32, truncated: bool) {
+        let band = match width {
+            0..=2 => width as usize,
+            3..=4 => 3,
+            5..=9 => 4,
+            _ => 5,
+        };
+        self.bands[band] += 1;
+        self.truncated += u64::from(truncated);
+    }
+
+    fn report(&self) {
+        let shown: Vec<String> = Self::LABELS
+            .iter()
+            .zip(self.bands)
+            .map(|(l, n)| format!("{l}: {n}"))
+            .collect();
+        eprintln!(
+            "scatter-gather width per payment: {}; {} searches stopped at the budget",
+            shown.join(" | "),
+            self.truncated
+        );
     }
 }
 
