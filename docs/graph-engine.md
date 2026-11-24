@@ -365,6 +365,32 @@ the next thing to speed up. The consumer stays one by one, since there the
 time to each answer matters more than throughput; batches are for computing
 training features (week 10) and for replays.
 
+**On a laptop.** The same whole-file run on an Intel Core i5-12500H (12
+cores: 4 performance cores with two threads each and 8 efficiency cores; 16
+threads under WSL2), one run each:
+
+| Mode | Time | Against one by one |
+| --- | --- | --- |
+| One by one | 43.18 s | 1.00× |
+| Batches of 4,096, 1 thread | 47.48 s | 0.91× |
+| Batches of 4,096, 2 threads | 33.17 s | 1.30× |
+| Batches of 4,096, 4 threads | 34.03 s | 1.27× |
+| Batches of 4,096, 8 threads | 34.49 s | 1.25× |
+| Batches of 32,768, 4 threads | 40.17 s | 1.07× |
+
+From the 1- and 2-thread runs, the cycle search is about 28.6 s of work and
+the serial passes about 18.9 s, so the search is a bigger share here than on
+the cloud machine and 2 threads win more (1.30×). Past 2 threads nothing
+improves, though Amdahl alone would allow about 26 s on 4. It is not a limit
+on cores (WSL sees all 16), and not one slow search holding up each batch
+(much bigger batches got slower, not faster). The likely causes are that the
+search spends its time waiting on memory (hopping between accounts' lists
+scattered across the heap), which extra cores do not fix, and the efficiency
+cores being slower than the performance cores; bigger batches also leave more
+evicted payments in the lists until tidying, so every search scans more. Use
+2 to 4 threads and batches of a few thousand. Making the search touch less
+memory, and shrinking the serial passes, are the next steps for speed.
+
 **How it was measured.** Whole-file numbers: release build, the same 2-core
 cloud VM, nothing else running, three runs each, median reported (runs
 varied by up to 10% on this shared machine). Synthetic numbers: Criterion
