@@ -74,7 +74,16 @@ pub fn scatter_gather(g: &WindowGraph, p: &Payment, budget: u32) -> ScatterGathe
             out.truncated = true;
             return false;
         };
-        if width > out.width() {
+        // ties go to the smallest (source, target), so the answer does not
+        // depend on the order a hash map happens to list accounts in
+        let better = match out.widest {
+            None => width > 0,
+            Some(w) => {
+                (width, std::cmp::Reverse((source, target)))
+                    > (w.width, std::cmp::Reverse((w.source, w.target)))
+            }
+        };
+        if better {
             out.widest = Some(Fan {
                 source,
                 target,
