@@ -104,6 +104,8 @@ time for lateness.
 | `detektive_graph_shortest_cycle` | histogram | Length of the shortest cycle, per payment closing one |
 | `detektive_graph_live_cycles` | gauge | Cycles found whose payments are all still in the window |
 | `detektive_graph_cycle_search_truncated_total` | counter | Cycle searches stopped at their budget (expected 0) |
+| `detektive_graph_scatter_gather_width` | histogram | Width of the widest scatter-gather each payment is part of |
+| `detektive_graph_scatter_gather_truncated_total` | counter | Scatter-gather searches stopped at their budget (expected 0) |
 
 What the graph metrics mean: [graph-engine.md](graph-engine.md).
 
