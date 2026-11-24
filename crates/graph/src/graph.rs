@@ -52,6 +52,10 @@ pub struct Half {
     pub peer: u32,
     pub tx: u32,
     pub amount: f64,
+    /// Insertion order: the n-th payment added to the graph has `seq` n.
+    /// Lets a search see the graph as it was when an earlier payment went
+    /// in (see `in_edges_as_of`).
+    pub seq: u32,
     pub format: u8,
 }
 
@@ -118,6 +122,14 @@ pub struct WindowGraph {
     /// Edges still in the window, by time: (src, dst) of each.
     expiry: BTreeMap<i64, Vec<(u32, u32)>>,
     stats: Stats,
+    /// The next payment's insertion order.
+    next_seq: u32,
+    /// While true, evicted payments are counted out at once but stay in the
+    /// adjacency lists until `tidy`, so searches can still look at the
+    /// graph as it was a few payments ago.
+    deferring: bool,
+    /// Accounts whose lists need tidying.
+    untidy: Vec<u32>,
 }
 
 impl WindowGraph {
@@ -130,6 +142,9 @@ impl WindowGraph {
             nodes: Vec::new(),
             expiry: BTreeMap::new(),
             stats: Stats::default(),
+            next_seq: 0,
+            deferring: false,
+            untidy: Vec::new(),
         }
     }
 
@@ -171,23 +186,38 @@ impl WindowGraph {
         evicted
     }
 
+    /// Count a payment out of the window. Its adjacency entries go now, or
+    /// at the next `tidy` while deferring.
     fn evict(&mut self, src: u32, dst: u32, cutoff: i64) {
         let node = &mut self.nodes[src as usize];
         node.out_live -= 1;
-        self.stats.stored -= pop_expired(&mut node.out, cutoff);
         self.stats.pairs -= uncount(&mut node.out_peers, dst);
-        self.release_if_empty(src);
-
+        if !node.is_live() {
+            self.stats.accounts -= 1;
+        }
+        // for a payment to oneself this is the same node, still live until
+        // the second half is counted out
         let node = &mut self.nodes[dst as usize];
         node.in_live -= 1;
-        self.stats.stored -= pop_expired(&mut node.inc, cutoff);
         self.stats.pairs -= uncount(&mut node.in_peers, src);
-        self.release_if_empty(dst);
+        if !node.is_live() {
+            self.stats.accounts -= 1;
+        }
+
+        if self.deferring {
+            self.untidy.extend([src, dst]);
+        } else {
+            self.tidy_account(src, cutoff);
+            self.tidy_account(dst, cutoff);
+        }
     }
 
-    /// An account with nothing left in the window gives its memory back.
-    fn release_if_empty(&mut self, id: u32) {
+    /// Drop an account's adjacency entries older than `cutoff`; an account
+    /// with nothing left in the window gives its memory back.
+    fn tidy_account(&mut self, id: u32, cutoff: i64) {
         let node = &mut self.nodes[id as usize];
+        self.stats.stored -=
+            pop_expired(&mut node.out, cutoff) + pop_expired(&mut node.inc, cutoff);
         if node.is_live() {
             return;
         }
@@ -200,7 +230,31 @@ impl WindowGraph {
         {
             *node = Node::default();
         }
-        self.stats.accounts -= 1;
+    }
+
+    /// From now until `tidy`, keep evicted payments in the adjacency lists
+    /// (counted out, but still there for `in_edges_as_of`).
+    pub fn defer_tidying(&mut self) {
+        self.deferring = true;
+    }
+
+    /// Remove what was evicted while deferring, and stop deferring.
+    pub fn tidy(&mut self) {
+        self.deferring = false;
+        let Some(cutoff) = self.cutoff else { return };
+        let mut untidy = std::mem::take(&mut self.untidy);
+        untidy.sort_unstable();
+        untidy.dedup();
+        for &id in &untidy {
+            self.tidy_account(id, cutoff);
+        }
+        untidy.clear();
+        self.untidy = untidy;
+    }
+
+    /// Insertion order of the payment added last.
+    pub fn last_seq(&self) -> u32 {
+        self.next_seq.wrapping_sub(1)
     }
 
     /// Add a payment. One already older than the window is refused: it
@@ -217,11 +271,14 @@ impl WindowGraph {
 
         let src = &mut self.nodes[p.src as usize];
         let was_live = src.is_live();
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
         src.out.push_back(Half {
             ts: p.ts,
             peer: p.dst,
             tx: p.tx,
             amount: p.amount,
+            seq,
             format: p.format,
         });
         src.out_live += 1;
@@ -238,6 +295,7 @@ impl WindowGraph {
             peer: p.src,
             tx: p.tx,
             amount: p.amount,
+            seq,
             format: p.format,
         });
         dst.in_live += 1;
@@ -264,12 +322,24 @@ impl WindowGraph {
 
     /// Payments `account` received inside the window.
     pub fn in_edges(&self, account: u32) -> impl Iterator<Item = &Half> {
-        let cutoff = self.cutoff.unwrap_or(i64::MIN);
+        self.in_edges_as_of(account, self.cutoff.unwrap_or(i64::MIN), u32::MAX)
+    }
+
+    /// Payments `account` received inside the window as it was when the
+    /// payment with insertion order `seq` went in, with cutoff `cutoff`.
+    /// Only meaningful for payments since the last `tidy`: older evicted
+    /// payments are gone from the lists.
+    pub fn in_edges_as_of(
+        &self,
+        account: u32,
+        cutoff: i64,
+        seq: u32,
+    ) -> impl Iterator<Item = &Half> {
         self.nodes
             .get(account as usize)
             .into_iter()
             .flat_map(|n| n.inc.iter())
-            .filter(move |h| h.ts >= cutoff)
+            .filter(move |h| h.ts >= cutoff && h.seq <= seq)
     }
 
     /// Payments sent inside the window, counting repeats to the same peer.

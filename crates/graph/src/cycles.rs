@@ -96,6 +96,10 @@ pub struct CycleFinder {
     path: Vec<Hop>,
     spent: u32,
     out: Cycles,
+    /// The view of the graph being searched: payments no older than
+    /// `cutoff`, inserted no later than `seq`.
+    cutoff: i64,
+    seq: u32,
 }
 
 impl CycleFinder {
@@ -110,11 +114,24 @@ impl CycleFinder {
             path: Vec::with_capacity(max_len),
             spent: 0,
             out: Cycles::default(),
+            cutoff: i64::MIN,
+            seq: u32::MAX,
         }
     }
 
     /// The cycles `p` closes in `g`. Call right after inserting `p`.
     pub fn closing(&mut self, g: &WindowGraph, p: &Payment) -> Cycles {
+        self.closing_as_of(g, p, g.cutoff().unwrap_or(i64::MIN), u32::MAX)
+    }
+
+    /// The cycles `p` closed when it went in: looking only at payments no
+    /// older than `cutoff` (the window's cutoff then) and inserted no later
+    /// than `seq` (its own insertion order). This is what lets searches for
+    /// a batch of payments run in parallel after the whole batch is in; see
+    /// `Engine::add_batch`.
+    pub fn closing_as_of(&mut self, g: &WindowGraph, p: &Payment, cutoff: i64, seq: u32) -> Cycles {
+        self.cutoff = cutoff;
+        self.seq = seq;
         self.out = Cycles::default();
         self.spent = 0;
         self.path.clear();
@@ -140,7 +157,7 @@ impl CycleFinder {
         let mut steps = std::mem::take(&mut self.levels[level]);
         steps.clear();
         self.seen.clear();
-        for h in g.in_edges(at) {
+        for h in g.in_edges_as_of(at, self.cutoff, self.seq) {
             self.spent += 1;
             if self.spent > self.budget {
                 self.out.truncated = true;
