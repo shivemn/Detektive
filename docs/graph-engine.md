@@ -1,16 +1,17 @@
 # Graph engine
 
-Weeks 5 to 7 add the engine's core: a live graph of who paid whom over a
+Weeks 5 to 8 add the engine's core: a live graph of who paid whom over a
 sliding window of event time (`crates/graph`), fed by the consumer, and the
-first features read off it for every payment: degree, fan-in, fan-out,
-repeats between a pair (week 6), and the temporal cycles a payment closes
-(week 7).
+features read off it for every payment: degree, fan-in, fan-out, repeats
+between a pair (week 6), the temporal cycles a payment closes (week 7), the
+shape of those rings, scatter-gather and gather-scatter (week 8).
 
 ```
 Redpanda --> consumer --> watermarks (one clock per partition)
                      \--> engine: window graph --advance--> evict old payments
                                               --insert---> degree and fan features
-                                              --search---> cycles this payment closes
+                                              --search---> cycles this payment closes, ring shape
+                                              --search---> widest scatter-gather it is part of
 ```
 
 ## The window graph
@@ -23,8 +24,8 @@ event time, four days by default (the cycles section explains why). When the
 watermark passes `t`, every payment older than `t - window` is evicted.
 
 **Layout.** Each account has two adjacency lists, payments out and payments
-in, with the time, the other account and the amount stored in the list
-itself. Walking a neighbourhood reads one contiguous list instead of
+in, with the time, the other account, the amount and the payment format
+stored in the list itself. Walking a neighbourhood reads one contiguous list instead of
 following pointers into a shared edge table. A matrix would need
 515,000 × 515,000 cells for a graph where the average account has a handful
 of edges; a compressed sparse row layout (CSR) is the fastest to read but has
@@ -47,16 +48,16 @@ which are unusually busy):
 
 | Window | Largest window | Accounts in it | Approx. memory | Speed, whole file |
 | --- | --- | --- | --- | --- |
-| 1 hour | 344,747 payments | 272,661 | 25 MB | 1.46 M payments/s |
-| 24 hours | 1,115,882 | 437,135 | 76 MB | 0.72 M/s |
-| **4 days (default)** | 2,284,988 | 511,553 | 146 MB | 0.36 M/s |
-| 7 days | 3,732,489 | 513,515 | 228 MB | 0.19 M/s |
+| 1 hour | 344,747 payments | 272,661 | 30 MB | 1.03 M payments/s |
+| 24 hours | 1,115,882 | 437,135 | 94 MB | 0.41 M/s |
+| **4 days (default)** | 2,284,988 | 511,553 | 183 MB | 0.27 M/s |
+| 7 days | 3,732,489 | 513,515 | 288 MB | 0.14 M/s |
 
 One core of a cloud VM, release build, after loading the file, with every
-feature (degree, fan and cycles) computed for every payment but not written
-out. Most of the time goes to the cycle search, whose cost grows with the
-window; the degree and fan features alone ran at 1.2 to 1.7 M payments/s for
-any of these windows. Run it yourself:
+feature (degree, fan, cycles, ring shape, scatter-gather) computed for every
+payment but not written out. Most of the time goes to the pattern searches,
+whose cost grows with the window; the degree and fan features alone ran at
+1.2 to 1.7 M payments/s for any of these windows. Run it yourself:
 
 ```bash
 cargo run --release -p detektive-graph -- data/raw/HI-Small_Trans.csv
@@ -232,8 +233,80 @@ Reproduce it (needs the patterns file next to the data):
 
 ```bash
 cargo run --release -p detektive-graph -- data/raw/HI-Small_Trans.csv --features features.csv
-python -m detektive_ml.cycle_report data/raw/HI-Small_Trans.csv data/raw/HI-Small_Patterns.txt features.csv
+python -m detektive_ml.pattern_report data/raw/HI-Small_Trans.csv data/raw/HI-Small_Patterns.txt features.csv
 ```
+
+## Ring shape (week 8)
+
+A cycle alone is not enough. Looking at the first rings the live consumer
+logged, most of the longer ones were two loops of five businesses paying each
+other again and again on a schedule, while the laundering ones were rings of
+three moving similar sums in one payment format. So each payment that closes
+a ring also gets the shape of the shortest one:
+
+| Feature | Meaning |
+| --- | --- |
+| `ring_repeats` | times the same set of accounts already closed a ring in the window |
+| `ring_one_format` | 1 if every payment in the ring has the same format |
+| `ring_amount_ratio` | smallest amount in the ring over the largest, in thousandths |
+
+Amounts are compared in one unit: each payment is converted to rupees at the
+replayer's fixed rates as it enters the engine. The rates are illustrative,
+which is fine for a ratio inside one ring.
+
+Measured over the whole file, the guess from the logs was half right. For
+rings of 3 or more, a ring seen for the first time is laundering 73% of the
+time (55 payments) and one that has closed 3 or more times before is never
+laundering (14). For rings of two it goes the other way: the more a pair has
+traded back and forth, the likelier it is laundering (3% the first time, 35%
+after three or more). Neither format nor amount ratio separates much on its
+own (one format: 9.9% laundering, mixed: 4.1%). A tree model can use all of
+this together; whether it does is week 10's question.
+
+## Scatter-gather and gather-scatter (week 8)
+
+```text
+scatter-gather                       gather-scatter
+         +--> m1 --+                 w1 --+          +--> p1
+  s -----+--> m2 --+----> t          w2 --+--> c ----+--> p2
+         +--> m3 --+                 w3 --+          +--> p3
+```
+
+In a **scatter-gather** one account pays several others that each pay the
+same final account: the money leaves in pieces and arrives in pieces, and no
+single payment or middle account looks unusual. What gives it away is the
+number of accounts between the same source and target. That is a
+**neighbour-set intersection**: the accounts `s` paid, intersected with the
+accounts that paid `t`.
+
+When a payment arrives it can be either half of a path through the middle:
+for `m -> t` every account that paid `m` is a possible source, and for
+`s -> m` every account `m` paid is a possible target. The feature
+`scatter_gather` is the widest one the payment is part of. Each intersection
+walks the smaller of the two sets and looks the other up in the
+per-counterparty map kept since week 6, so it costs the smaller degree. A
+budget (100,000 accounts per payment) caps the work; on HI-Small no search
+reached it. Time order is not required: in 6 of HI-Small's 44 attempts the
+money reaches `t` from a middle account before `s` has paid that account.
+
+A **gather-scatter** collects from many accounts and pays out to many. The
+features `src_gather_scatter` and `dst_gather_scatter` are the smaller of
+the account's fan-in and fan-out: high only when both are.
+
+Results on HI-Small (4-day window):
+
+- **Scatter-gather: the last payment of 43 of the 44 attempts sees their full
+  width; all 30 attempts with 3 or more accounts in the middle show 3 or
+  more.** Only 503 of 5 million payments are part of a scatter-gather 3 wide,
+  and 49.7% of them are laundering; at 5 wide, 78.8% (231 payments), against
+  0.10% overall. Width 2 is common in normal traffic (63,000 payments, 0.7%).
+- **Gather-scatter is weak.** The centre's payments out show the attempt's
+  full gather-scatter in 33 of 51 attempts; most of the rest take longer than
+  the window (only 12 of the 51 finish within 4 days, the longest takes 202
+  hours). And collecting from many and paying many is what ordinary busy
+  accounts do: payments from accounts with a gather-scatter of 5 or more are
+  laundering 0.20% of the time, barely above the base rate. It stays as a
+  feature, but it will not carry a model.
 
 ## How it is tested
 
@@ -253,7 +326,11 @@ python -m detektive_ml.cycle_report data/raw/HI-Small_Trans.csv data/raw/HI-Smal
   the same cycles, the same shortest length, the same oldest-payment time
   for each, a valid shortest example made of real payments in the window,
   and the same per-account counts as cycles expire. Over 32,000 cycles,
-  including ones of 6 payments; with the length limit raised to 12 too.
+  including ones of 6 payments; with the length limit raised to 12 too. The
+  same streams check scatter-gather (every pair of accounts the payment
+  could connect, middles counted by scanning every payment in the window;
+  widths of 3 and more must occur) and ring repeats, format and amount
+  ratio against every ring recorded so far.
 - **Against an independent recount in Python**
   (`ml/src/detektive_ml/graph_check.py`): numpy recounts every feature for
   every payment from the raw CSV, with none of the engine's bookkeeping, and
@@ -274,8 +351,12 @@ too late (should be 0), how far the watermark trails the newest event, and
 payments in against payments evicted per second. Below it, receiver fan-in
 and sender fan-out at p50, p99 and p99.9, then payments closing a cycle per
 minute (rings of two apart from longer ones), cycles in the window, cycles
-closed, and cycle searches cut short (should be 0). The consumer also logs
-every payment that closes a cycle, with the ring's accounts.
+closed, and cycle searches cut short (should be 0), and payments in a
+scatter-gather 3 or more wide. The consumer logs every payment that closes a
+cycle, with the ring's accounts, and every payment in a scatter-gather 5 or
+more wide, with its source and target. The logs are plain text unless the
+consumer is writing to a terminal, so `docker compose logs consumer | grep`
+works.
 
 ## Known gaps
 
@@ -283,7 +364,7 @@ every payment that closes a cycle, with the ring's accounts.
   cycles have payments out of order. A plain (non-temporal) cycle search
   inside the window would find them, at a much higher cost since time no
   longer prunes the search; the Graph Feature Preprocessor offers both kinds.
-  A candidate for week 9.
+  Possible later; for now the 49 of 54 stands.
 - **A ring is flagged when it closes, not before.** Its earlier payments were
   already scored by then. `src_cycles` and `dst_cycles` flag the accounts'
   later payments; raising an alert on the earlier ones after the fact is a
@@ -303,8 +384,12 @@ every payment that closes a cycle, with the ring's accounts.
   planned with the scorer.
 - **Account ids are dense small integers** because the replayer assigns them.
   Data from elsewhere needs the same interning in its adapter (week 23).
-- **Amounts are kept but not used yet.** Payments are in many currencies; the
-  amount features (and fixed exchange rates) come with the pattern detectors.
+- **Amounts use fixed, illustrative exchange rates.** Good enough for a ratio
+  inside one ring; not for absolute amounts, which a real deployment would
+  convert at the day's rate.
+- **Gather-scatter outlasts the window** in 39 of HI-Small's 51 attempts. A
+  longer window for this one feature would need a second, cheaper store of
+  per-account counts; not worth it while the feature is this weak.
 
 ## Theory behind it
 
@@ -325,6 +410,11 @@ every payment that closes a cycle, with the ring's accounts.
   cycles and time-window pruning (Kumar and Calders' 2SCENT, 2018; Blanuša
   et al.'s work on temporal and hop-constrained cycles); why bounded
   enumeration still needs a budget.
+- **Subgraph pattern matching**: finding small fixed shapes (a scatter-gather
+  is a "diamond" with many middles) in a large graph; why matching from the
+  new edge outwards, instead of over the whole graph, keeps it incremental;
+  neighbour-set intersection, and why walking the smaller set and probing
+  the larger keeps its cost at the smaller degree.
 - **Degree distributions**: heavy tails, power laws and how to fit one
   (Clauset, Shalizi and Newman 2009, "Power-law distributions in empirical
   data"); why hubs dominate the cost of naive graph algorithms.
