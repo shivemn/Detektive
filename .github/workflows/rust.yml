@@ -2,9 +2,9 @@ name: rust
 
 on:
   push:
-    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml", "ml/tests/fixtures/**", "observability/grafana/dashboards/**", "ml/src/detektive_ml/graph_check.py", "scripts/check_features.sh"]
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml", "ml/tests/fixtures/**", "observability/grafana/dashboards/**", "ml/src/detektive_ml/graph_check.py", "ml/src/detektive_ml/nx_check.py", "ml/src/detektive_ml/synthetic.py", "scripts/check_features.sh"]
   pull_request:
-    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml", "ml/tests/fixtures/**", "observability/grafana/dashboards/**", "ml/src/detektive_ml/graph_check.py", "scripts/check_features.sh"]
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml", "ml/tests/fixtures/**", "observability/grafana/dashboards/**", "ml/src/detektive_ml/graph_check.py", "ml/src/detektive_ml/nx_check.py", "ml/src/detektive_ml/synthetic.py", "scripts/check_features.sh"]
   workflow_dispatch:
 
 env:
@@ -28,7 +28,8 @@ jobs:
       # end-to-end tests use librdkafka's in-process mock cluster: no Docker needed
       - run: cargo test --workspace --all-features
 
-  # the engine's features against a brute-force recount in Python
+  # the engine's features against a brute-force recount in Python and
+  # against NetworkX, and batch mode against one by one
   features:
     runs-on: ubuntu-latest
     steps:

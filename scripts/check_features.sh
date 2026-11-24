@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Cross-check the Rust engine's degree and fan features against a brute-force
 # recount in Python, on a synthetic sample, with a long and a short window.
-# Then check that adding payments in parallel batches gives the same
+# Then check cycles, scatter-gather and degrees against NetworkX on a dense
+# sample, and that adding payments in parallel batches gives the same
 # features, byte for byte, as adding them one by one.
 # Runs in CI; works locally too (needs cargo and the ml package installed).
 #
@@ -25,6 +26,14 @@ for hours in 24 1; do
     PYTHONPATH=ml/src python3 -m detektive_ml.graph_check \
         "$WORK/sample.csv" "$WORK/features.csv" --window-hours "$hours"
 done
+
+echo "== cycles, scatter-gather and degrees against NetworkX (dense sample)"
+PYTHONPATH=ml/src python3 -m detektive_ml.synthetic "$WORK/dense.csv" \
+    --rows 3000 --accounts 25 --banks 1 --seed 11 >/dev/null
+"$BIN" "$WORK/dense.csv" --window-hours 6 --max-cycle-len 8 --features "$WORK/dense_features.csv" 2>&1 |
+    grep "closed"
+PYTHONPATH=ml/src python3 -m detektive_ml.nx_check \
+    "$WORK/dense.csv" "$WORK/dense_features.csv" --window-hours 6 --max-cycle-len 8
 
 echo "== batches on several threads against one by one"
 "$BIN" "$WORK/sample.csv" --features "$WORK/one.csv" 2>/dev/null
