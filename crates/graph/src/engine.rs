@@ -39,6 +39,8 @@ impl Default for EngineConfig {
 /// What the engine says about one payment.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Observation {
+    /// The payment this is about.
+    pub tx: u32,
     pub features: Features,
     pub cycles: Cycles,
     pub scatter_gather: ScatterGather,
@@ -101,6 +103,7 @@ impl Engine {
         let scatter_gather = scatter_gather(&self.graph, &p, self.sg_budget);
         features.scatter_gather = scatter_gather.width();
         Some(Observation {
+            tx: p.tx,
             features,
             cycles,
             scatter_gather,

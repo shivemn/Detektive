@@ -59,6 +59,10 @@ struct Args {
     #[arg(long, default_value_t = 100_000)]
     cycle_budget: u32,
 
+    /// Accounts one scatter-gather search may look at before it gives up
+    #[arg(long, default_value_t = 100_000)]
+    scatter_gather_budget: u32,
+
     /// Seconds of silence after which a partition stops holding the
     /// watermark back
     #[arg(long, default_value_t = 10)]
@@ -89,6 +93,7 @@ async fn main() -> Result<()> {
             window: Duration::from_secs_f64(args.window_hours * 3600.0),
             max_cycle_len: args.max_cycle_len,
             cycle_budget: args.cycle_budget,
+            scatter_gather_budget: args.scatter_gather_budget,
             idle_partition: Duration::from_secs(args.idle_partition_secs),
         },
     };

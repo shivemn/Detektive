@@ -62,6 +62,8 @@ pub struct Metrics {
     pub shortest_cycle: Histogram,
     pub cycle_truncated: IntCounter,
     pub live_cycles: IntGauge,
+    pub scatter_gather: Histogram,
+    pub scatter_gather_truncated: IntCounter,
 }
 
 impl Metrics {
@@ -188,6 +190,17 @@ impl Metrics {
                 "detektive_graph_live_cycles",
                 "Cycles found whose payments are all still inside the window",
             )?,
+            scatter_gather: Histogram::with_opts(
+                HistogramOpts::new(
+                    "detektive_graph_scatter_gather_width",
+                    "Accounts in the middle of the widest scatter-gather each payment is part of",
+                )
+                .buckets(vec![1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0]),
+            )?,
+            scatter_gather_truncated: IntCounter::new(
+                "detektive_graph_scatter_gather_truncated_total",
+                "Scatter-gather searches stopped at their budget (there may have been a wider one)",
+            )?,
             registry,
         };
         m.registry.register(Box::new(m.messages.clone()))?;
@@ -213,6 +226,9 @@ impl Metrics {
         m.registry.register(Box::new(m.shortest_cycle.clone()))?;
         m.registry.register(Box::new(m.cycle_truncated.clone()))?;
         m.registry.register(Box::new(m.live_cycles.clone()))?;
+        m.registry.register(Box::new(m.scatter_gather.clone()))?;
+        m.registry
+            .register(Box::new(m.scatter_gather_truncated.clone()))?;
         // make every outcome visible from the start, at 0
         for outcome in ["processed", "duplicate", "bad"] {
             m.messages.with_label_values(&[outcome]);
@@ -340,6 +356,8 @@ mod tests {
             "detektive_graph_cycles_total 0",
             "detektive_graph_live_cycles 0",
             "detektive_graph_shortest_cycle_bucket",
+            "detektive_graph_scatter_gather_width_bucket",
+            "detektive_graph_scatter_gather_truncated_total 0",
         ] {
             assert!(text.contains(name), "missing {name} in\n{text}");
         }

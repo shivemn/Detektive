@@ -48,6 +48,7 @@ pub struct GraphSettings {
     pub window: Duration,
     pub max_cycle_len: usize,
     pub cycle_budget: u32,
+    pub scatter_gather_budget: u32,
     pub idle_partition: Duration,
 }
 
@@ -60,6 +61,7 @@ impl Default for GraphSettings {
             window: Duration::from_secs(engine.window as u64),
             max_cycle_len: engine.max_cycle_len,
             cycle_budget: engine.cycle_budget,
+            scatter_gather_budget: engine.scatter_gather_budget,
             idle_partition: Duration::from_secs(10),
         }
     }
@@ -107,7 +109,7 @@ impl State {
                 window: settings.window.as_secs() as i64,
                 max_cycle_len: settings.max_cycle_len,
                 cycle_budget: settings.cycle_budget,
-                ..EngineConfig::default()
+                scatter_gather_budget: settings.scatter_gather_budget,
             }),
         }
     }

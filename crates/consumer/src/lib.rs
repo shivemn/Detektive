@@ -188,11 +188,25 @@ pub async fn run(
                             if o.cycles.truncated {
                                 metrics.cycle_truncated.inc();
                             }
+                            let sg = o.scatter_gather;
+                            metrics.scatter_gather.observe(f64::from(f.scatter_gather));
+                            if sg.truncated {
+                                metrics.scatter_gather_truncated.inc();
+                            }
+                            if let Some(fan) = sg.widest.filter(|w| w.width >= 5) {
+                                info!(
+                                    tx = o.tx,
+                                    source = fan.source,
+                                    target = fan.target,
+                                    width = fan.width,
+                                    "payment is part of a wide scatter-gather"
+                                );
+                            }
                             if f.cycles > 0 {
                                 metrics.cycles.inc_by(u64::from(f.cycles));
                                 metrics.shortest_cycle.observe(f64::from(f.shortest_cycle));
                                 info!(
-                                    tx = o.cycles.example.last().map(|h| h.tx),
+                                    tx = o.tx,
                                     cycles = f.cycles,
                                     shortest = f.shortest_cycle,
                                     ring = ?o.cycles.example.iter().map(|h| h.src).collect::<Vec<_>>(),
