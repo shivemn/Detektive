@@ -6,8 +6,9 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use detektive_graph::{Engine, EngineConfig, Features, Payment, Stats, WindowGraph};
+use detektive_graph::{Engine, EngineConfig, Features, Observation, Payment, Stats, WindowGraph};
 use detektive_replay::load;
+use detektive_replay::model::Transaction;
 
 /// Run an IBM AML transactions file through the graph engine, in time order:
 /// report how big the window gets, how fast it runs, how degrees are
@@ -42,10 +43,25 @@ struct Args {
     /// Write tx_id and the features of every payment to this CSV
     #[arg(long)]
     features: Option<PathBuf>,
+
+    /// Add payments in batches of this many, searching for cycles on several
+    /// threads (0: one by one). The features are the same either way.
+    #[arg(long, default_value_t = 0)]
+    batch: usize,
+
+    /// Threads for batches (default: one per core)
+    #[arg(long)]
+    threads: Option<usize>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(n) = args.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .context("setting up threads")?;
+    }
 
     let started = Instant::now();
     let data = load::load_csv(&args.input)?;
@@ -85,44 +101,56 @@ fn main() -> Result<()> {
     let mut next_snapshot = i64::MIN;
     let mut line = String::new();
     let started = Instant::now();
-    for t in &data.transactions[..take] {
-        // one stream in time order: the newest event is the watermark
-        engine.advance(t.ts);
-        let p = Payment {
-            tx: t.tx_id,
-            ts: t.ts,
-            src: t.src,
-            dst: t.dst,
-            amount: detektive_replay::india::to_inr(t.amount_paid, t.paid_currency),
-            format: t.format as u8,
+    // one stream in time order: the newest event is the watermark
+    let payment = |t: &Transaction| Payment {
+        tx: t.tx_id,
+        ts: t.ts,
+        src: t.src,
+        dst: t.dst,
+        amount: detektive_replay::india::to_inr(t.amount_paid, t.paid_currency),
+        format: t.format as u8,
+    };
+    for group in data.transactions[..take].chunks(args.batch.max(1)) {
+        let observed: Vec<Option<Observation>> = if args.batch == 0 {
+            group
+                .iter()
+                .map(|t| {
+                    engine.advance(t.ts);
+                    engine.add(payment(t))
+                })
+                .collect()
+        } else {
+            let batch: Vec<(i64, Payment)> = group.iter().map(|t| (t.ts, payment(t))).collect();
+            engine.add_batch(&batch)
         };
-        let Some(obs) = engine.add(p) else {
-            continue; // in time order nothing is ever too late
-        };
-        cycles.count(&obs.features, obs.cycles.truncated);
-        fans.count(obs.features.scatter_gather, obs.scatter_gather.truncated);
-        let features = obs.features;
-        if let Some(w) = out.as_mut() {
-            line.clear();
-            line.push_str(&t.tx_id.to_string());
-            for v in features.values() {
-                line.push(',');
-                line.push_str(&v.to_string());
+        // in time order nothing is ever too late
+        for obs in observed.into_iter().flatten() {
+            cycles.count(&obs.features, obs.cycles.truncated);
+            fans.count(obs.features.scatter_gather, obs.scatter_gather.truncated);
+            if let Some(w) = out.as_mut() {
+                line.clear();
+                line.push_str(&obs.tx.to_string());
+                for v in obs.features.values() {
+                    line.push(',');
+                    line.push_str(&v.to_string());
+                }
+                line.push('\n');
+                w.write_all(line.as_bytes())?;
             }
-            line.push('\n');
-            w.write_all(line.as_bytes())?;
         }
 
+        // checked once per batch in batch mode
         let s = engine.graph().stats();
         if s.edges > peak.edges {
             peak = s;
         }
         // once an hour of event time, keep the degree picture of the
         // fullest window seen so far
-        if t.ts >= next_snapshot {
-            next_snapshot = t.ts + 3600;
+        let ts = group.last().map_or(0, |t| t.ts);
+        if ts >= next_snapshot {
+            next_snapshot = ts + 3600;
             if s.edges > degrees.edges {
-                degrees = Degrees::of(engine.graph(), t.ts);
+                degrees = Degrees::of(engine.graph(), ts);
             }
         }
     }
@@ -133,9 +161,18 @@ fn main() -> Result<()> {
 
     let end = engine.graph().stats();
     eprintln!(
-        "{take} payments through a {}h window in {elapsed:.2}s ({:.0}/s{})",
+        "{take} payments through a {}h window in {elapsed:.2}s ({:.0}/s{}{})",
         args.window_hours,
         take as f64 / elapsed.max(f64::EPSILON),
+        if args.batch > 0 {
+            format!(
+                ", batches of {} on {} threads",
+                args.batch,
+                rayon::current_num_threads()
+            )
+        } else {
+            String::new()
+        },
         if args.features.is_some() {
             ", writing features"
         } else {

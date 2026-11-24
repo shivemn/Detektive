@@ -1,5 +1,27 @@
 //! The window graph, the pattern searches and the cycle counts per account,
 //! moved together: one call to add a payment and get its features.
+//!
+//! **Batches in parallel.** About a third of the time per payment goes to the
+//! cycle search, and searches only read the graph, so a batch of payments can
+//! be searched on several threads at once. The catch is that the answer must
+//! not change: each search has to see the graph exactly as it was right
+//! after its own payment went in, not as it is after the whole batch.
+//! `add_batch` does it in three passes:
+//!
+//! 1. one thread adds the batch payment by payment, moving the window as it
+//!    goes, and reads the cheap features (degree, fan, scatter-gather) at
+//!    the right moment. Payments that leave the window are counted out at
+//!    once but left in the adjacency lists for now;
+//! 2. many threads search for cycles, each payment against the window as it
+//!    was for it: no payment older than its cutoff then, and none inserted
+//!    after it (every edge carries its insertion order);
+//! 3. one thread, in order again, folds the cycles found into the per-account
+//!    counts and finishes each payment's features.
+//!
+//! Then the lists are tidied. The result is identical to adding the payments
+//! one by one; `tests/batch.rs` checks that on random streams.
+
+use rayon::prelude::*;
 
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
@@ -51,7 +73,18 @@ pub struct Engine {
     graph: WindowGraph,
     finder: CycleFinder,
     members: CycleMembers,
+    max_cycle_len: usize,
+    cycle_budget: u32,
     sg_budget: u32,
+}
+
+/// A payment that went into the window, with what was read at that moment.
+struct Placed {
+    p: Payment,
+    cutoff: i64,
+    seq: u32,
+    features: Features,
+    scatter_gather: ScatterGather,
 }
 
 impl Engine {
@@ -60,6 +93,8 @@ impl Engine {
             graph: WindowGraph::new(cfg.window),
             finder: CycleFinder::new(cfg.max_cycle_len, cfg.cycle_budget),
             members: CycleMembers::default(),
+            max_cycle_len: cfg.max_cycle_len,
+            cycle_budget: cfg.cycle_budget,
             sg_budget: cfg.scatter_gather_budget,
         }
     }
@@ -80,11 +115,75 @@ impl Engine {
     /// Add a payment and read its features. `None` if it was already older
     /// than the window.
     pub fn add(&mut self, p: Payment) -> Option<Observation> {
+        let placed = self.place(p)?;
+        let cycles = self
+            .finder
+            .closing_as_of(&self.graph, &placed.p, placed.cutoff, placed.seq);
+        Some(self.finish(placed, cycles))
+    }
+
+    /// Add a batch of payments, each with the watermark to move the window
+    /// to first, searching for cycles on rayon's threads. Gives exactly what
+    /// `advance` and `add` would, payment by payment.
+    pub fn add_batch(&mut self, batch: &[(i64, Payment)]) -> Vec<Option<Observation>> {
+        self.graph.defer_tidying();
+        let placed: Vec<Option<Placed>> = batch
+            .iter()
+            .map(|&(watermark, p)| {
+                // the per-account cycle counts expire in the last pass, at
+                // each payment's own cutoff
+                self.graph.advance(watermark);
+                self.place(p)
+            })
+            .collect();
+
+        let graph = &self.graph;
+        let (max_len, budget) = (self.max_cycle_len, self.cycle_budget);
+        let cycles: Vec<Option<Cycles>> = placed
+            .par_iter()
+            .map_init(
+                || CycleFinder::new(max_len, budget),
+                |finder, placed| {
+                    placed
+                        .as_ref()
+                        .map(|pl| finder.closing_as_of(graph, &pl.p, pl.cutoff, pl.seq))
+                },
+            )
+            .collect();
+
+        let out = placed
+            .into_iter()
+            .zip(cycles)
+            .map(|(placed, cycles)| Some(self.finish(placed?, cycles?)))
+            .collect();
+        self.graph.tidy();
+        out
+    }
+
+    /// Insert `p` and read what does not depend on the cycle search.
+    fn place(&mut self, p: Payment) -> Option<Placed> {
         if self.graph.insert(p) == Insert::TooLate {
             return None;
         }
-        let cycles = self.finder.closing(&self.graph, &p);
-        let mut features = self.graph.degree_features(&p);
+        Some(Placed {
+            p,
+            cutoff: self.graph.cutoff().unwrap_or(i64::MIN),
+            seq: self.graph.last_seq(),
+            features: self.graph.degree_features(&p),
+            scatter_gather: scatter_gather(&self.graph, &p, self.sg_budget),
+        })
+    }
+
+    /// Fold in the cycles `placed` closes and finish its features.
+    fn finish(&mut self, placed: Placed, cycles: Cycles) -> Observation {
+        let Placed {
+            p,
+            cutoff,
+            mut features,
+            scatter_gather,
+            ..
+        } = placed;
+        self.members.expire(cutoff);
         if !cycles.example.is_empty() {
             let ring = &cycles.example;
             // counted before this payment's own rings are added
@@ -99,15 +198,13 @@ impl Engine {
         features.shortest_cycle = cycles.shortest;
         features.src_cycles = self.members.of(p.src);
         features.dst_cycles = self.members.of(p.dst);
-
-        let scatter_gather = scatter_gather(&self.graph, &p, self.sg_budget);
         features.scatter_gather = scatter_gather.width();
-        Some(Observation {
+        Observation {
             tx: p.tx,
             features,
             cycles,
             scatter_gather,
-        })
+        }
     }
 
     /// Cycles currently counted against accounts (found inside the window).
