@@ -23,11 +23,21 @@ FORMATS = ["Cheque", "Credit Card", "ACH", "Cash", "Wire", "Reinvestment", "Bitc
 CURRENCIES = ["US Dollar", "Euro", "Rupee", "Yuan", "UK Pound"]
 
 
-def write_sample(path: Path, rows: int = 20_000, seed: int = 7, positive_rate: float = 0.01) -> Path:
+def write_sample(
+    path: Path,
+    rows: int = 20_000,
+    seed: int = 7,
+    positive_rate: float = 0.01,
+    accounts: int | None = None,
+    banks: int = 29,
+) -> Path:
+    """`accounts` per bank (default: a tenth of the rows) and `banks` set how
+    dense the payment graph is: few accounts and one bank give many repeated
+    pairs, cycles and scatter-gathers, for checking the graph engine."""
     rng = np.random.default_rng(seed)
     start = datetime(2022, 9, 1)
     minutes = np.sort(rng.integers(0, 10 * 24 * 60, size=rows))
-    n_accounts = max(rows // 10, 50)
+    n_accounts = accounts or max(rows // 10, 50)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
@@ -40,7 +50,7 @@ def write_sample(path: Path, rows: int = 20_000, seed: int = 7, positive_rate: f
             if laundering and rng.random() < 0.5:
                 amount = round(amount, -3) or 1000.0
             currency = str(rng.choice(CURRENCIES))
-            src_bank, dst_bank = rng.integers(1, 30, size=2)
+            src_bank, dst_bank = rng.integers(1, banks + 1, size=2)
             src, dst = rng.integers(0, n_accounts, size=2)
             writer.writerow([
                 (start + timedelta(minutes=int(m))).strftime("%Y/%m/%d %H:%M"),
@@ -56,8 +66,10 @@ def main() -> None:
     parser.add_argument("out", type=Path)
     parser.add_argument("--rows", type=int, default=20_000)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--accounts", type=int, default=None, help="accounts per bank")
+    parser.add_argument("--banks", type=int, default=29)
     args = parser.parse_args()
-    print(write_sample(args.out, args.rows, args.seed))
+    print(write_sample(args.out, args.rows, args.seed, accounts=args.accounts, banks=args.banks))
 
 
 if __name__ == "__main__":
