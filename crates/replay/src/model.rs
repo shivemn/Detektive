@@ -48,6 +48,30 @@ impl Currency {
         })
     }
 
+    /// Every currency in the IBM files.
+    pub const ALL: [Self; 15] = [
+        Self::UsDollar,
+        Self::Euro,
+        Self::UkPound,
+        Self::SwissFranc,
+        Self::Yuan,
+        Self::Rupee,
+        Self::Yen,
+        Self::Ruble,
+        Self::CanadianDollar,
+        Self::AustralianDollar,
+        Self::SaudiRiyal,
+        Self::Shekel,
+        Self::MexicanPeso,
+        Self::BrazilReal,
+        Self::Bitcoin,
+    ];
+
+    /// The currency with this code, as the stream carries it.
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.code() == code)
+    }
+
     /// ISO 4217 code ("BTC" is the common unofficial one).
     pub fn code(self) -> &'static str {
         match self {
@@ -95,6 +119,22 @@ impl PaymentFormat {
         })
     }
 
+    /// Every payment format in the IBM files.
+    pub const ALL: [Self; 7] = [
+        Self::Ach,
+        Self::Cheque,
+        Self::CreditCard,
+        Self::Cash,
+        Self::Wire,
+        Self::Reinvestment,
+        Self::Bitcoin,
+    ];
+
+    /// The format with this name, as the stream carries it ("ach", ...).
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.as_str() == code)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ach => "ach",
@@ -133,6 +173,22 @@ pub struct Transaction {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codes_round_trip() {
+        for c in Currency::ALL {
+            assert_eq!(Currency::from_code(c.code()), Some(c));
+        }
+        for f in PaymentFormat::ALL {
+            assert_eq!(PaymentFormat::from_code(f.as_str()), Some(f));
+        }
+        assert_eq!(Currency::from_code("XYZ"), None);
+        assert_eq!(
+            PaymentFormat::from_code("ACH"),
+            None,
+            "the stream uses lower case"
+        );
+    }
+
     use super::*;
 
     #[test]
