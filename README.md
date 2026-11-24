@@ -10,7 +10,7 @@ arrives. Every alert says which pattern it matched and why.
 The engine will be written in Rust. Models are trained in Python and served
 from Rust through ONNX.
 
-> **Status: week 8 of about 24.** What exists today is the data pipeline, the
+> **Status: week 9 of about 24.** What exists today is the data pipeline, the
 > evaluation protocol, a floor baseline, a Rust replayer that streams the data
 > in time order, a consumer service reading that stream from Redpanda,
 > Prometheus metrics with a Grafana dashboard, and the graph engine's
@@ -96,8 +96,10 @@ account paying several that each pay the same final account), from a
 neighbour-set intersection. The last payment of 43 of the 44 scatter-gather
 attempts in HI-Small sees the attempt's full width; payments in a
 scatter-gather 5 accounts wide are laundering 78.8% of the time. The whole
-engine runs at about 270,000 payments a second on one core. Design,
-measurements and tests:
+engine runs at about 270,000 payments a second on one core. A batch mode
+searches for cycles on several threads and gives exactly the same features,
+byte for byte on all of HI-Small. Every structural feature also matches
+NetworkX exactly. Design, measurements and tests:
 [docs/graph-engine.md](docs/graph-engine.md).
 
 ## Running it
