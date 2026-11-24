@@ -1,10 +1,12 @@
 # Graph engine
 
-Weeks 5 to 8 add the engine's core: a live graph of who paid whom over a
+Weeks 5 to 9 add the engine's core: a live graph of who paid whom over a
 sliding window of event time (`crates/graph`), fed by the consumer, and the
 features read off it for every payment: degree, fan-in, fan-out, repeats
 between a pair (week 6), the temporal cycles a payment closes (week 7), the
-shape of those rings, scatter-gather and gather-scatter (week 8).
+shape of those rings, scatter-gather and gather-scatter (week 8). Week 9
+checks all of it against NetworkX and adds a parallel batch mode that gives
+the same answers.
 
 ```
 Redpanda --> consumer --> watermarks (one clock per partition)
@@ -308,6 +310,73 @@ Results on HI-Small (4-day window):
   laundering 0.20% of the time, barely above the base rate. It stays as a
   feature, but it will not carry a model.
 
+## Parallel batches (week 9)
+
+Each payment's features depend on every payment before it, so the stream
+cannot simply be split across threads. But the cycle search only reads the
+graph, and on HI-Small it is about a third of the time per payment. So
+`Engine::add_batch` takes a batch of payments and works in three passes:
+
+1. **One thread, in order:** add each payment, moving the window as it goes,
+   and read the cheap features (degree, fan, scatter-gather) at that moment.
+   Payments that leave the window are counted out at once but stay in the
+   adjacency lists for now.
+2. **Many threads (rayon):** search for the cycles each payment closes,
+   against the window *as it was for that payment*: every edge carries its
+   insertion order, so a search ignores payments added after its own and
+   payments older than its own cutoff.
+3. **One thread, in order:** fold the cycles found into the per-account
+   counts and finish each payment's features. Then tidy the lists.
+
+The result is **identical** to adding the payments one by one: the same
+features, and the same cycles down to the example payments chosen. A test
+compares the two on 12 random streams with batches of random size on 4
+threads; on all 5,078,345 payments of HI-Small the feature files written
+one by one, in batches on 1 thread and in batches on 2 threads are byte for
+byte the same, and CI repeats that check on a sample. Getting there turned up
+one real bug: when two scatter-gathers tied for widest, which one was
+reported depended on the order a hash map happened to list accounts in. Ties
+now go to the smallest account ids.
+
+Each thread keeps its own search scratch space, and results land in a vector
+each thread writes its own part of; nothing in the hot loop is shared
+between threads (no locks, no shared counters). A counter every thread
+bumped would keep its cache line moving between cores (true sharing, or
+false sharing if unrelated counters happened to sit on the same 64-byte
+line), which is the usual way parallel code ends up slower than serial.
+
+**How much faster.** It depends on how much of the work is the cycle search
+(Amdahl's law: the serial passes set the limit).
+
+| Case | One by one | Batches of 4,096 | Speed-up |
+| --- | --- | --- | --- |
+| HI-Small, whole file, 2 threads | 21.95 s | 19.76 s | 1.11× |
+| HI-Small, whole file, 1 thread | 21.95 s | 25.29 s | 0.87× |
+| Synthetic stream with heavy hubs, 2 threads | 2.67 s | 1.63 s | 1.64× |
+
+On HI-Small the search is a minority of the time, and batching itself costs
+about 15% (the extra pass, longer lists until tidying), so two cores barely
+win and more cores cannot win much: even if the cycle search took no time at
+all, the batch run would still need about 90% of the one-by-one time (75%
+without batching's own overhead). On the
+synthetic stream, where hubs make the search most of the work, two threads
+give 1.6×. The serial passes (window upkeep, degree and scatter-gather) are
+the next thing to speed up. The consumer stays one by one, since there the
+time to each answer matters more than throughput; batches are for computing
+training features (week 10) and for replays.
+
+**How it was measured.** Whole-file numbers: release build, the same 2-core
+cloud VM, nothing else running, three runs each, median reported (runs
+varied by up to 10% on this shared machine). Synthetic numbers: Criterion
+(`cargo bench -p detektive-graph`), which warms up, takes repeated samples
+and reports a confidence interval. Numbers from different machines are not
+comparable; run both on yours:
+
+```bash
+cargo run --release -p detektive-graph -- data/raw/HI-Small_Trans.csv --batch 4096 --threads 4
+cargo bench -p detektive-graph
+```
+
 ## How it is tested
 
 - **Against a brute-force reference** (`crates/graph/tests/reference.rs`):
@@ -338,6 +407,19 @@ Results on HI-Small (4-day window):
   24-hour and a 1-hour window, in CI. On four hours of real HI-Small
   (77,781 payments, including an account paying 356 others in an hour) all
   nine features match exactly.
+- **Against NetworkX** (`ml/src/detektive_ml/nx_check.py`): for every
+  payment, in time order, the window's payments sit in a NetworkX
+  MultiDiGraph and NetworkX answers: degrees and distinct counterparties,
+  repeats between the pair, every simple path from the receiver back to the
+  sender (kept if its payments can run in time order), and neighbour-set
+  intersections for scatter-gather. None of the engine's shortcuts are used.
+  All 14 structural features match exactly on a dense synthetic sample in
+  CI (3,000 payments, 1,006 closing a cycle of up to 8, 406 in a
+  scatter-gather 3 or more wide) and on every payment between the 1,283
+  accounts of HI-Small's cycle, scatter-gather and gather-scatter attempts
+  with the real settings (5,418 payments, 4-day window, cycles up to 12; 286
+  close a cycle, 300 are in a scatter-gather 3 or more wide).
+- **Batches against one by one** (`crates/graph/tests/batch.rs`), see above.
 - **End to end on the mock cluster**: 3,000 payments over 50 hours through
   three partitions. Nothing arrives behind its own partition, nothing is
   refused, and every payment is either in the window or was evicted from it.
@@ -392,6 +474,17 @@ works.
   per-account counts; not worth it while the feature is this weak.
 
 ## Theory behind it
+
+- **Parallelism and its limits**: data parallelism with rayon (work
+  stealing, `par_iter`, `map_init` for per-thread state); Amdahl's law and
+  why the serial part sets the ceiling; making a parallel version produce
+  exactly the serial answer (snapshots by insertion order, deterministic tie
+  breaks).
+- **Concurrency costs**: cache lines, true and false sharing, why per-thread
+  state beats shared counters and locks in a hot loop.
+- **Benchmarking method**: warm-up, repeated runs, medians and confidence
+  intervals, noise on shared machines, micro-benchmarks (Criterion) against
+  whole-workload timings, comparing only like with like.
 
 - **Graph representations**: adjacency matrix, adjacency list, CSR; which
   operations each makes cheap; why a constantly changing sparse graph uses
