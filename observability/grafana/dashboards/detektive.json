@@ -1365,6 +1365,116 @@
         "graphMode": "none",
         "textMode": "value"
       }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Payments in a scatter-gather",
+      "description": "Payments that are part of a scatter-gather (one account paying several others that each pay the same final account), per minute, by the number of accounts in the middle. Three or more is rare in normal traffic.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 14,
+        "x": 0,
+        "y": 61
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "60 * (sum(rate(detektive_graph_scatter_gather_width_count[$__rate_interval])) - sum(rate(detektive_graph_scatter_gather_width_bucket{le=\"2\"}[$__rate_interval])))",
+          "legendFormat": "3 or more in the middle"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "60 * (sum(rate(detektive_graph_scatter_gather_width_count[$__rate_interval])) - sum(rate(detektive_graph_scatter_gather_width_bucket{le=\"5\"}[$__rate_interval])))",
+          "legendFormat": "more than 5"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 32,
+      "type": "stat",
+      "title": "Scatter-gather searches cut short",
+      "description": "Scatter-gather searches that hit their budget, so a wider one may have been missed. Should stay 0.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 10,
+        "x": 14,
+        "y": 61
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(detektive_graph_scatter_gather_truncated_total)",
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
     }
   ]
 }
