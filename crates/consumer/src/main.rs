@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::io::IsTerminal;
+
 use tracing_subscriber::EnvFilter;
 
 use detektive_consumer::metrics::{self, Metrics};
@@ -69,6 +71,9 @@ async fn main() -> Result<()> {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        // colours only on a terminal: in `docker compose logs` or a file the
+        // escape codes would break grep and log tools
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
     let args = Args::parse();
 
