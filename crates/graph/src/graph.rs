@@ -306,6 +306,22 @@ impl WindowGraph {
             .unwrap_or(0)
     }
 
+    /// Accounts `account` paid inside the window.
+    pub fn out_peers(&self, account: u32) -> impl Iterator<Item = u32> + '_ {
+        self.nodes
+            .get(account as usize)
+            .into_iter()
+            .flat_map(|n| n.out_peers.keys().copied())
+    }
+
+    /// Accounts that paid `account` inside the window.
+    pub fn in_peers(&self, account: u32) -> impl Iterator<Item = u32> + '_ {
+        self.nodes
+            .get(account as usize)
+            .into_iter()
+            .flat_map(|n| n.in_peers.keys().copied())
+    }
+
     /// Accounts with at least one payment inside the window.
     pub fn accounts(&self) -> impl Iterator<Item = u32> + '_ {
         self.nodes
