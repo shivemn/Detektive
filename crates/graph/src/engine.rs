@@ -144,6 +144,7 @@ mod tests {
             src,
             dst,
             amount: 1.0,
+            format: 0,
         }
     }
 

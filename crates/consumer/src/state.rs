@@ -16,6 +16,9 @@ use detektive_graph::{
     Arrival, Engine, EngineConfig, Observation, Payment, Watermarks, WindowGraph,
 };
 
+use detektive_replay::india;
+use detektive_replay::model::{Currency, PaymentFormat};
+
 use crate::bitset::BitSet;
 use crate::event::{DecodeError, decode};
 
@@ -136,6 +139,7 @@ impl State {
             }
         };
         self.max_lateness = self.max_lateness.max(lateness);
+        let format = PaymentFormat::from_code(&event.format).map_or(u8::MAX, |f| f as u8);
         // only allocates the first time a format is seen
         match self.by_format.get_mut(event.format.as_ref()) {
             Some(n) => *n += 1,
@@ -156,7 +160,10 @@ impl State {
             ts: event.ts,
             src: event.src,
             dst: event.dst,
-            amount: event.amount,
+            // one unit for every currency, so the engine can compare amounts
+            amount: Currency::from_code(&event.currency)
+                .map_or(event.amount, |c| india::to_inr(event.amount, c)),
+            format,
         };
         let observation = self.engine.add(payment);
         Outcome::Processed {

@@ -98,6 +98,7 @@ fn run(seed: u64, steps: usize, window: i64, accounts: u64, max_len: usize) -> (
             src,
             dst,
             amount: 1.0,
+            format: 0,
         };
 
         watermark = watermark.max(ts);

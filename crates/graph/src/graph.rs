@@ -30,13 +30,18 @@ use std::collections::{BTreeMap, VecDeque};
 use rustc_hash::FxHashMap;
 
 /// A payment as the graph needs it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Payment {
     pub tx: u32,
     pub ts: i64,
     pub src: u32,
     pub dst: u32,
+    /// In one common unit for every currency (the callers use rupees at the
+    /// replayer's fixed rates), so amounts can be compared with each other.
     pub amount: f64,
+    /// Payment format (ACH, cheque, ...) as a small code; only compared
+    /// for equality.
+    pub format: u8,
 }
 
 /// One end of an edge, as stored in an account's adjacency list: `peer` is
@@ -47,6 +52,7 @@ pub struct Half {
     pub peer: u32,
     pub tx: u32,
     pub amount: f64,
+    pub format: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +222,7 @@ impl WindowGraph {
             peer: p.dst,
             tx: p.tx,
             amount: p.amount,
+            format: p.format,
         });
         src.out_live += 1;
         self.stats.pairs += count(&mut src.out_peers, p.dst);
@@ -231,6 +238,7 @@ impl WindowGraph {
             peer: p.src,
             tx: p.tx,
             amount: p.amount,
+            format: p.format,
         });
         dst.in_live += 1;
         self.stats.pairs += count(&mut dst.in_peers, p.src);
@@ -350,6 +358,7 @@ mod tests {
             src,
             dst,
             amount: 1.0,
+            format: 0,
         }
     }
 

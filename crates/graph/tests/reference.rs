@@ -96,6 +96,7 @@ fn run(seed: u64, steps: usize, window: i64, accounts: u32) {
             src,
             dst,
             amount: rng.below(10_000) as f64,
+            format: 0,
         };
 
         // wall clock moves one second per step, so quiet partitions go idle
@@ -227,6 +228,7 @@ fn memory_is_released_once_the_stream_moves_on() {
             src: i % 500,
             dst: (i * 7) % 500,
             amount: 1.0,
+            format: 0,
         });
         g.advance(i as i64);
     }

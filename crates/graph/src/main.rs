@@ -87,7 +87,8 @@ fn main() -> Result<()> {
             ts: t.ts,
             src: t.src,
             dst: t.dst,
-            amount: t.amount_paid,
+            amount: detektive_replay::india::to_inr(t.amount_paid, t.paid_currency),
+            format: t.format as u8,
         };
         let Some(obs) = engine.add(p) else {
             continue; // in time order nothing is ever too late
