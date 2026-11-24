@@ -34,3 +34,20 @@ def test_counts_rows_it_cannot_find(tmp_path):
     path = tmp_path / "patterns.txt"
     path.write_text(PATTERNS.replace("14675.57,US Dollar,14675.57", "1.00,US Dollar,1.00"))
     assert attach_tx_ids(parse(path), FIXTURE) == 1
+
+
+def _row(src: str, dst: str) -> str:
+    return f"2022/09/01 00:00,001,{src},001,{dst},1.00,US Dollar,1.00,US Dollar,ACH,1"
+
+
+def test_widths_of_scatter_gather_and_gather_scatter():
+    from detektive_ml.pattern_report import gather_scatter, scatter_gather_width
+    from detektive_ml.patterns import Attempt
+
+    # S pays A, B, C; each pays T
+    sg = Attempt("SCATTER-GATHER", "", [_row("S", m) for m in "ABC"] + [_row(m, "T") for m in "ABC"])
+    assert scatter_gather_width(sg) == 3
+
+    # four accounts pay C; C pays two
+    gs = Attempt("GATHER-SCATTER", "", [_row(p, "C") for p in "WXYZ"] + [_row("C", q) for q in "PQ"])
+    assert gather_scatter(gs) == ("001:C", 2)
