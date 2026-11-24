@@ -1,11 +1,15 @@
-//! The window graph, the cycle search and the cycle counts per account,
+//! The window graph, the pattern searches and the cycle counts per account,
 //! moved together: one call to add a payment and get its features.
 
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 
-use crate::cycles::{CycleFinder, Cycles};
+use rustc_hash::{FxHashMap, FxHasher};
+
+use crate::cycles::{CycleFinder, Cycles, Hop};
 use crate::features::Features;
 use crate::graph::{Insert, Payment, WindowGraph};
+use crate::scatter_gather::{ScatterGather, scatter_gather};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EngineConfig {
@@ -15,6 +19,8 @@ pub struct EngineConfig {
     pub max_cycle_len: usize,
     /// Payments one cycle search may look at before it stops.
     pub cycle_budget: u32,
+    /// Accounts one scatter-gather search may look at before it stops.
+    pub scatter_gather_budget: u32,
 }
 
 impl Default for EngineConfig {
@@ -25,15 +31,17 @@ impl Default for EngineConfig {
             window: 4 * 24 * 3600,
             max_cycle_len: 12,
             cycle_budget: 100_000,
+            scatter_gather_budget: 100_000,
         }
     }
 }
 
 /// What the engine says about one payment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Observation {
     pub features: Features,
     pub cycles: Cycles,
+    pub scatter_gather: ScatterGather,
 }
 
 #[derive(Debug)]
@@ -41,6 +49,7 @@ pub struct Engine {
     graph: WindowGraph,
     finder: CycleFinder,
     members: CycleMembers,
+    sg_budget: u32,
 }
 
 impl Engine {
@@ -49,6 +58,7 @@ impl Engine {
             graph: WindowGraph::new(cfg.window),
             finder: CycleFinder::new(cfg.max_cycle_len, cfg.cycle_budget),
             members: CycleMembers::default(),
+            sg_budget: cfg.scatter_gather_budget,
         }
     }
 
@@ -72,15 +82,29 @@ impl Engine {
             return None;
         }
         let cycles = self.finder.closing(&self.graph, &p);
+        let mut features = self.graph.degree_features(&p);
+        if !cycles.example.is_empty() {
+            let ring = &cycles.example;
+            // counted before this payment's own rings are added
+            features.ring_repeats = self.members.closings(ring_key(ring.iter().map(|h| h.src)));
+            features.ring_one_format = u32::from(ring.iter().all(|h| h.format == ring[0].format));
+            features.ring_amount_ratio = amount_ratio(ring);
+        }
         for c in &cycles.found {
             self.members.add(c.oldest, &c.accounts);
         }
-        let mut features = self.graph.degree_features(&p);
         features.cycles = cycles.count;
         features.shortest_cycle = cycles.shortest;
         features.src_cycles = self.members.of(p.src);
         features.dst_cycles = self.members.of(p.dst);
-        Some(Observation { features, cycles })
+
+        let scatter_gather = scatter_gather(&self.graph, &p, self.sg_budget);
+        features.scatter_gather = scatter_gather.width();
+        Some(Observation {
+            features,
+            cycles,
+            scatter_gather,
+        })
     }
 
     /// Cycles currently counted against accounts (found inside the window).
@@ -89,12 +113,36 @@ impl Engine {
     }
 }
 
-/// How many cycles found inside the window each account is part of. A cycle
-/// stops counting when its oldest payment leaves the window.
+/// Smallest amount in the ring over the largest, in thousandths.
+fn amount_ratio(ring: &[Hop]) -> u32 {
+    let (lo, hi) = ring.iter().fold((f64::INFINITY, 0f64), |(lo, hi), h| {
+        (lo.min(h.amount), hi.max(h.amount))
+    });
+    if hi > 0.0 {
+        (1000.0 * lo / hi).round() as u32
+    } else {
+        1000
+    }
+}
+
+/// The same set of accounts gives the same key, whichever account the ring
+/// is read from.
+fn ring_key(accounts: impl Iterator<Item = u32>) -> u64 {
+    let mut sorted: Vec<u32> = accounts.collect();
+    sorted.sort_unstable();
+    let mut h = FxHasher::default();
+    sorted.hash(&mut h);
+    h.finish()
+}
+
+/// How many cycles found inside the window each account is part of, and how
+/// many times each set of accounts closed one. A cycle stops counting when
+/// its oldest payment leaves the window.
 #[derive(Debug, Default)]
 struct CycleMembers {
     counts: Vec<u32>,
-    expiry: BTreeMap<i64, Vec<Vec<u32>>>,
+    rings: FxHashMap<u64, u32>,
+    expiry: BTreeMap<i64, Vec<(u64, Vec<u32>)>>,
     live: usize,
 }
 
@@ -107,10 +155,12 @@ impl CycleMembers {
             }
             self.counts[i] += 1;
         }
+        let key = ring_key(accounts.iter().copied());
+        *self.rings.entry(key).or_insert(0) += 1;
         self.expiry
             .entry(oldest)
             .or_default()
-            .push(accounts.to_vec());
+            .push((key, accounts.to_vec()));
         self.live += 1;
     }
 
@@ -119,13 +169,23 @@ impl CycleMembers {
             if *entry.key() >= cutoff {
                 break;
             }
-            for accounts in entry.remove() {
+            for (key, accounts) in entry.remove() {
                 for a in accounts {
                     self.counts[a as usize] -= 1;
+                }
+                let n = self.rings.get_mut(&key).expect("a counted ring");
+                *n -= 1;
+                if *n == 0 {
+                    self.rings.remove(&key);
                 }
                 self.live -= 1;
             }
         }
+    }
+
+    /// Cycles through exactly this set of accounts found inside the window.
+    fn closings(&self, key: u64) -> u32 {
+        self.rings.get(&key).copied().unwrap_or(0)
     }
 
     fn of(&self, account: u32) -> u32 {
@@ -184,6 +244,66 @@ mod tests {
         let after = e.add(pay(4, 111, 2, 9)).unwrap();
         assert_eq!(after.features.src_cycles, 0);
         assert_eq!(e.live_cycles(), 0);
+    }
+
+    #[test]
+    fn a_ring_that_keeps_closing_is_counted() {
+        let mut e = engine(1_000);
+        let add = |e: &mut Engine, tx, ts, src, dst| {
+            e.advance(ts);
+            e.add(pay(tx, ts, src, dst)).unwrap().features
+        };
+        add(&mut e, 0, 10, 1, 2);
+        add(&mut e, 1, 11, 2, 3);
+        let first = add(&mut e, 2, 12, 3, 1);
+        assert_eq!((first.cycles, first.ring_repeats), (1, 0));
+        // 3 pays 1 again: the same three accounts close a ring once more
+        let again = add(&mut e, 3, 20, 3, 1);
+        assert_eq!((again.cycles, again.ring_repeats), (1, 1));
+        assert_eq!(again.ring_one_format, 1);
+        assert_eq!(again.ring_amount_ratio, 1000);
+    }
+
+    #[test]
+    fn ring_shape_reads_formats_and_amounts() {
+        let mut e = engine(1_000);
+        let payments = [
+            Payment {
+                amount: 500.0,
+                format: 1,
+                ..pay(0, 10, 1, 2)
+            },
+            Payment {
+                amount: 1000.0,
+                format: 1,
+                ..pay(1, 20, 2, 3)
+            },
+            Payment {
+                amount: 250.0,
+                format: 2,
+                ..pay(2, 30, 3, 1)
+            },
+        ];
+        let mut f = Features::default();
+        for p in payments {
+            e.advance(p.ts);
+            f = e.add(p).unwrap().features;
+        }
+        assert_eq!((f.ring_one_format, f.ring_amount_ratio), (0, 250));
+    }
+
+    #[test]
+    fn reports_the_widest_scatter_gather() {
+        let mut e = engine(1_000);
+        let mut obs = None;
+        for (i, m) in [10, 11, 12, 13].into_iter().enumerate() {
+            let i = i as u32;
+            e.add(pay(2 * i, 10, 1, m));
+            obs = e.add(pay(2 * i + 1, 20, m, 2));
+        }
+        let obs = obs.unwrap();
+        assert_eq!(obs.features.scatter_gather, 4);
+        assert_eq!(obs.scatter_gather.widest.unwrap().source, 1);
     }
 
     #[test]

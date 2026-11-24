@@ -27,6 +27,26 @@
 //!   last payment arrives, after its earlier payments were already scored;
 //!   these two carry the finding forward to every later payment of the
 //!   accounts in the ring.
+//!
+//! The shape of the shortest ring this payment closes, because a ring alone
+//! is not enough: on HI-Small, businesses paying each other in a loop on a
+//! schedule close the same ring again and again, with very different amounts
+//! and mixed payment formats, while the laundering rings close once or
+//! twice, in one format, moving similar sums:
+//!
+//! - ring repeats: how many times the same set of accounts already closed a
+//!   ring inside the window;
+//! - ring one format: 1 if every payment in the ring has the same format;
+//! - ring amount ratio: smallest amount in the ring over the largest, in
+//!   thousandths (1000 means all equal).
+//!
+//! Then scatter-gather and gather-scatter (`scatter_gather.rs`):
+//!
+//! - scatter-gather: the widest one the payment is part of, in accounts in
+//!   the middle;
+//! - sender's and receiver's gather-scatter: the smaller of the account's
+//!   fan-in and fan-out, so high only when many accounts pay it *and* it pays
+//!   many (money collected and spread again). All 0 to 3 for most accounts.
 
 use crate::graph::{Payment, WindowGraph};
 
@@ -45,11 +65,17 @@ pub struct Features {
     pub shortest_cycle: u32,
     pub src_cycles: u32,
     pub dst_cycles: u32,
+    pub ring_repeats: u32,
+    pub ring_one_format: u32,
+    pub ring_amount_ratio: u32,
+    pub scatter_gather: u32,
+    pub src_gather_scatter: u32,
+    pub dst_gather_scatter: u32,
 }
 
 impl Features {
     /// Column names, in the order of `values`.
-    pub const NAMES: [&'static str; 13] = [
+    pub const NAMES: [&'static str; 19] = [
         "src_out_degree",
         "src_fan_out",
         "src_in_degree",
@@ -63,9 +89,15 @@ impl Features {
         "shortest_cycle",
         "src_cycles",
         "dst_cycles",
+        "ring_repeats",
+        "ring_one_format",
+        "ring_amount_ratio",
+        "scatter_gather",
+        "src_gather_scatter",
+        "dst_gather_scatter",
     ];
 
-    pub fn values(&self) -> [u32; 13] {
+    pub fn values(&self) -> [u32; 19] {
         [
             self.src_out_degree,
             self.src_fan_out,
@@ -80,6 +112,12 @@ impl Features {
             self.shortest_cycle,
             self.src_cycles,
             self.dst_cycles,
+            self.ring_repeats,
+            self.ring_one_format,
+            self.ring_amount_ratio,
+            self.scatter_gather,
+            self.src_gather_scatter,
+            self.dst_gather_scatter,
         ]
     }
 }
@@ -99,6 +137,8 @@ impl WindowGraph {
             dst_out_degree: self.out_degree(p.dst),
             dst_fan_out: self.fan_out(p.dst),
             pair_count: self.pair_count(p.src, p.dst),
+            src_gather_scatter: self.fan_in(p.src).min(self.fan_out(p.src)),
+            dst_gather_scatter: self.fan_in(p.dst).min(self.fan_out(p.dst)),
             ..Features::default()
         }
     }
@@ -143,6 +183,8 @@ mod tests {
                 dst_out_degree: 0,
                 dst_fan_out: 0,
                 pair_count: 1,
+                // 9 is paid by five and pays one
+                src_gather_scatter: 1,
                 ..Features::default()
             }
         );
@@ -164,8 +206,14 @@ mod tests {
             shortest_cycle: 11,
             src_cycles: 12,
             dst_cycles: 13,
+            ring_repeats: 14,
+            ring_one_format: 15,
+            ring_amount_ratio: 16,
+            scatter_gather: 17,
+            src_gather_scatter: 18,
+            dst_gather_scatter: 19,
         };
-        assert_eq!(f.values(), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+        assert_eq!(f.values(), std::array::from_fn(|i| i as u32 + 1));
         assert_eq!(Features::NAMES.len(), f.values().len());
     }
 }

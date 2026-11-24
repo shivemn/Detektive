@@ -1,9 +1,11 @@
-//! The cycle search against brute force: for every payment, list every chain
-//! of individual payments that runs from its receiver back to its sender in
-//! time order, inside the window, without repeating an account, and group
-//! them by the accounts they pass through. No pruning, no "latest payment
-//! per pair" shortcut: if the engine's reasoning is wrong anywhere, the
-//! counts differ.
+//! The pattern searches against brute force. For cycles: for every payment,
+//! list every chain of individual payments that runs from its receiver back
+//! to its sender in time order, inside the window, without repeating an
+//! account, and group them by the accounts they pass through. No pruning, no
+//! "latest payment per pair" shortcut: if the engine's reasoning is wrong
+//! anywhere, the counts differ. For scatter-gather: try every pair of
+//! accounts the payment could connect and count the middles by scanning
+//! every payment in the window.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -65,12 +67,45 @@ fn brute(live: &[Payment], p: &Payment, max_len: usize) -> BTreeMap<Vec<u32>, i6
     found
 }
 
+/// Accounts other than `s` and `t` that `s` paid and that paid `t`.
+fn middles(live: &[Payment], s: u32, t: u32) -> u32 {
+    if s == t {
+        return 0;
+    }
+    let paid: BTreeSet<u32> = live.iter().filter(|e| e.src == s).map(|e| e.dst).collect();
+    let paid_t: BTreeSet<u32> = live.iter().filter(|e| e.dst == t).map(|e| e.src).collect();
+    paid.intersection(&paid_t)
+        .filter(|&&x| x != s && x != t)
+        .count() as u32
+}
+
+/// The widest scatter-gather `p` is part of, trying every source and target.
+fn brute_scatter_gather(live: &[Payment], p: &Payment) -> u32 {
+    if p.src == p.dst {
+        return 0;
+    }
+    let sources = live
+        .iter()
+        .filter(|e| e.dst == p.src && e.src != p.src)
+        .map(|e| e.src);
+    let targets = live
+        .iter()
+        .filter(|e| e.src == p.dst && e.dst != p.dst)
+        .map(|e| e.dst);
+    sources
+        .map(|s| middles(live, s, p.dst))
+        .chain(targets.map(|t| middles(live, p.src, t)))
+        .max()
+        .unwrap_or(0)
+}
+
 fn run(seed: u64, steps: usize, window: i64, accounts: u64, max_len: usize) -> (u32, u32) {
     let mut rng = Rng(seed);
     let mut engine = Engine::new(EngineConfig {
         window,
         max_cycle_len: max_len,
         cycle_budget: u32::MAX,
+        scatter_gather_budget: u32::MAX,
     });
     let mut live: Vec<Payment> = Vec::new();
     // every cycle found so far: (latest first-payment time, accounts)
@@ -79,6 +114,7 @@ fn run(seed: u64, steps: usize, window: i64, accounts: u64, max_len: usize) -> (
     let mut clock = 0i64;
     let mut watermark = i64::MIN;
     let (mut total, mut longest) = (0u32, 0u32);
+    let mut widest = 0u32;
 
     for step in 0..steps {
         clock += rng.below(20) as i64;
@@ -97,8 +133,8 @@ fn run(seed: u64, steps: usize, window: i64, accounts: u64, max_len: usize) -> (
             ts,
             src,
             dst,
-            amount: 1.0,
-            format: 0,
+            amount: 1.0 + rng.below(1000) as f64,
+            format: rng.below(3) as u8,
         };
 
         watermark = watermark.max(ts);
@@ -114,6 +150,52 @@ fn run(seed: u64, steps: usize, window: i64, accounts: u64, max_len: usize) -> (
         };
         live.push(p);
         let c = &obs.cycles;
+
+        // scatter-gather, recounted from every payment in the window
+        assert!(!obs.scatter_gather.truncated);
+        assert_eq!(
+            obs.features.scatter_gather,
+            brute_scatter_gather(&live, &p),
+            "scatter-gather at step {step}"
+        );
+        widest = widest.max(obs.features.scatter_gather);
+        if let Some(fan) = obs.scatter_gather.widest {
+            assert_eq!(fan.width, middles(&live, fan.source, fan.target));
+        }
+
+        // ring shape: repeats against every ring recorded so far
+        if c.count > 0 && all_recorded {
+            let mut key: Vec<u32> = c.example.iter().map(|h| h.src).collect();
+            key.sort_unstable();
+            let before = recorded
+                .iter()
+                .filter(|(_, acc)| {
+                    let mut a = acc.clone();
+                    a.sort_unstable();
+                    a == key
+                })
+                .count() as u32;
+            assert_eq!(
+                obs.features.ring_repeats, before,
+                "ring repeats at step {step}"
+            );
+        }
+        if c.count > 0 {
+            let ex = &c.example;
+            let same = ex.iter().all(|h| h.format == ex[0].format);
+            assert_eq!(obs.features.ring_one_format, u32::from(same));
+            let lo = ex.iter().map(|h| h.amount).fold(f64::INFINITY, f64::min);
+            let hi = ex.iter().map(|h| h.amount).fold(0.0, f64::max);
+            assert_eq!(
+                obs.features.ring_amount_ratio,
+                (1000.0 * lo / hi).round() as u32
+            );
+        } else {
+            assert_eq!(
+                obs.features.ring_one_format + obs.features.ring_amount_ratio,
+                0
+            );
+        }
 
         assert!(!c.truncated);
         assert_eq!(
@@ -147,7 +229,9 @@ fn run(seed: u64, steps: usize, window: i64, accounts: u64, max_len: usize) -> (
                     tx: p.tx,
                     ts: p.ts,
                     src: p.src,
-                    dst: p.dst
+                    dst: p.dst,
+                    amount: p.amount,
+                    format: p.format,
                 }
             );
             assert_eq!(ex[0].src, p.dst);
@@ -187,6 +271,8 @@ fn run(seed: u64, steps: usize, window: i64, accounts: u64, max_len: usize) -> (
         total += c.count;
         longest = longest.max(expected.keys().map(|k| k.len() as u32).max().unwrap_or(0));
     }
+    // the stream must contain real scatter-gathers, not just lone paths
+    assert!(widest >= 3, "widest scatter-gather {widest}");
     (total, longest)
 }
 

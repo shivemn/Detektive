@@ -107,6 +107,7 @@ impl State {
                 window: settings.window.as_secs() as i64,
                 max_cycle_len: settings.max_cycle_len,
                 cycle_budget: settings.cycle_budget,
+                ..EngineConfig::default()
             }),
         }
     }

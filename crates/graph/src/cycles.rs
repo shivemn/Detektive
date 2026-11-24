@@ -38,12 +38,14 @@ use rustc_hash::FxHashMap;
 use crate::graph::{Payment, WindowGraph};
 
 /// One payment in a cycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Hop {
     pub tx: u32,
     pub ts: i64,
     pub src: u32,
     pub dst: u32,
+    pub amount: f64,
+    pub format: u8,
 }
 
 /// A cycle found by a search: its accounts, starting with the receiver of the
@@ -57,7 +59,7 @@ pub struct Found {
 /// Cycles recorded per search, at most. Counting goes on past this.
 pub const MAX_RECORDED: usize = 64;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Cycles {
     /// Distinct cycles (as sequences of accounts) the payment closes.
     pub count: u32,
@@ -76,6 +78,8 @@ struct Step {
     peer: u32,
     ts: i64,
     tx: u32,
+    amount: f64,
+    format: u8,
 }
 
 /// Searches for the cycles a payment closes. Keeps its scratch space between
@@ -122,6 +126,8 @@ impl CycleFinder {
             ts: p.ts,
             src: p.src,
             dst: p.dst,
+            amount: p.amount,
+            format: p.format,
         });
         self.search(g, p.src, p.ts, p.dst, 0);
         std::mem::take(&mut self.out)
@@ -144,22 +150,19 @@ impl CycleFinder {
             if h.ts > bound {
                 continue;
             }
+            let step = Step {
+                peer: h.peer,
+                ts: h.ts,
+                tx: h.tx,
+                amount: h.amount,
+                format: h.format,
+            };
             match self.seen.get(&h.peer) {
-                Some(&i) if steps[i].ts < h.ts => {
-                    steps[i] = Step {
-                        peer: h.peer,
-                        ts: h.ts,
-                        tx: h.tx,
-                    }
-                }
+                Some(&i) if steps[i].ts < h.ts => steps[i] = step,
                 Some(_) => {}
                 None => {
                     self.seen.insert(h.peer, steps.len());
-                    steps.push(Step {
-                        peer: h.peer,
-                        ts: h.ts,
-                        tx: h.tx,
-                    });
+                    steps.push(step);
                 }
             }
         }
@@ -173,6 +176,8 @@ impl CycleFinder {
                 ts: s.ts,
                 src: s.peer,
                 dst: at,
+                amount: s.amount,
+                format: s.format,
             };
             if s.peer == target {
                 self.record(hop);

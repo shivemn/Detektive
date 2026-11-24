@@ -31,6 +31,10 @@ struct Args {
     #[arg(long, default_value_t = 100_000)]
     cycle_budget: u32,
 
+    /// Accounts one scatter-gather search may look at before it gives up
+    #[arg(long, default_value_t = 100_000)]
+    scatter_gather_budget: u32,
+
     /// Stop after this many transactions
     #[arg(long)]
     limit: Option<usize>,
@@ -72,6 +76,7 @@ fn main() -> Result<()> {
         window,
         max_cycle_len: args.max_cycle_len,
         cycle_budget: args.cycle_budget,
+        scatter_gather_budget: args.scatter_gather_budget,
     });
     let mut peak = Stats::default();
     let mut cycles = CycleSummary::default();

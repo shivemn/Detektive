@@ -180,6 +180,14 @@ fn run(seed: u64, steps: usize, window: i64, accounts: u32) {
         let f = graph.degree_features(&payment);
         assert_eq!(f.src_fan_out, graph.fan_out(payment.src));
         assert_eq!(f.dst_in_degree, graph.in_degree(payment.dst));
+        assert_eq!(
+            f.src_gather_scatter,
+            graph.fan_in(payment.src).min(graph.fan_out(payment.src))
+        );
+        assert_eq!(
+            f.dst_gather_scatter,
+            graph.fan_in(payment.dst).min(graph.fan_out(payment.dst))
+        );
 
         let live: Vec<&Payment> = reference.live(cutoff).collect();
         let stats = graph.stats();
