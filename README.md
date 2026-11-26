@@ -10,13 +10,14 @@ arrives. Every alert says which pattern it matched and why.
 The engine will be written in Rust. Models are trained in Python and served
 from Rust through ONNX.
 
-> **Status: week 9 of about 24.** What exists today is the data pipeline, the
+> **Status: week 10 of about 24.** What exists today is the data pipeline, the
 > evaluation protocol, a floor baseline, a Rust replayer that streams the data
 > in time order, a consumer service reading that stream from Redpanda,
-> Prometheus metrics with a Grafana dashboard, and the graph engine's
-> features: a time-windowed payment graph with per-partition watermarks,
-> degree and fan features, temporal cycles and their shape, scatter-gather
-> and gather-scatter for every payment. No models on graph features yet.
+> Prometheus metrics with a Grafana dashboard, the graph engine's features
+> (a time-windowed payment graph with per-partition watermarks; degree and fan
+> features, temporal cycles and their shape, scatter-gather and gather-scatter
+> for every payment), and boosted-tree models trained on them. The models are
+> not yet scored inside the stream.
 
 ## Data
 
@@ -38,11 +39,22 @@ HI-Small, test set, mean ± std over 3 seeds, in percent.
 | Model | F1 | PR-AUC | F1 incl. tail | PR-AUC incl. tail |
 | --- | --- | --- | --- | --- |
 | XGBoost on single-row features (floor) | 12.38 ± 0.49 | 5.16 ± 0.22 | 23.07 ± 0.33 | 11.53 ± 0.38 |
+| XGBoost on row + graph features | 41.80 ± 0.99 | 38.68 ± 0.82 | 57.38 ± 0.80 | 58.17 ± 0.83 |
+| LightGBM on row + graph features | **42.79 ± 0.73** | **39.90 ± 0.53** | **58.61 ± 0.59** | **59.39 ± 0.50** |
 
 The main columns leave out the near-empty last days of the data, which are
 mostly laundering and easy to catch; including them nearly doubles every
 score. Why, and what else the data looks like:
 [docs/data-notes-hi-small.md](docs/data-notes-hi-small.md).
+
+The graph features are computed in stream order, so each payment only sees the
+payments before it, as a live system would. They account for about 27 of the
+30 points between the floor and the graph models; the other 3 come from
+better tree settings, which lift single-row features to about 15 on their own.
+Published results on HI-Small reach about 63 F1 with tree models on graph
+features computed over the whole test graph, future payments included. The
+comparison, ablations and how the settings were chosen:
+[docs/models.md](docs/models.md).
 
 ## The stream
 
@@ -130,6 +142,9 @@ docker compose run --rm replay --speed 3600
 # the graph window over the whole file, with each payment's features
 cargo run --release -p detektive-graph -- data/raw/HI-Small_Trans.csv --features features.csv
 bash scripts/check_features.sh       # features against a brute-force recount
+
+# boosted trees on row + graph features (about 6 GB of memory)
+cd ml && python -m detektive_ml.models.graph_boost ../data/processed/hi_small.parquet ../features.csv
 ```
 
 No dataset yet? `python -m detektive_ml.synthetic sample.csv` writes a small
@@ -141,7 +156,7 @@ fake file in the same format, good enough to check the pipeline runs.
 crates/    Rust: replay (the payment stream), consumer (reads it from Redpanda),
            graph (the time-windowed graph and its features)
 observability/  Prometheus config, Grafana provisioning and dashboard
-ml/        Python: data loading, time split, evaluation, baselines
+ml/        Python: data loading, time split, evaluation, baselines, models
 docs/      design notes and the evaluation protocol
 data/      datasets (not committed)
 results/   one JSON file per experiment (not committed)

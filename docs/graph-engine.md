@@ -263,7 +263,9 @@ laundering (14). For rings of two it goes the other way: the more a pair has
 traded back and forth, the likelier it is laundering (3% the first time, 35%
 after three or more). Neither format nor amount ratio separates much on its
 own (one format: 9.9% laundering, mixed: 4.1%). A tree model can use all of
-this together; whether it does is week 10's question.
+this together; whether it does is week 10's question. (Partly: `ring_repeats`
+is XGBoost's fourth feature by gain, while LightGBM leans on `pair_count` and
+the cycle counts instead; see [models.md](models.md).)
 
 ## Scatter-gather and gather-scatter (week 8)
 
