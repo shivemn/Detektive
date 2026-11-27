@@ -28,3 +28,7 @@ target/
 .idea/
 .DS_Store
 Thumbs.db
+
+# trained models (see models/README.md)
+models/*
+!models/README.md

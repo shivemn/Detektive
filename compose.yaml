@@ -9,6 +9,11 @@
 #   Prometheus:                               http://localhost:9090
 #   Grafana (dashboard "Detektive"):          http://localhost:3000
 #
+# To score payments, export a model into ./models (see docs/scoring.md) and
+# set DETEKTIVE_MODEL=/models, on the command line or in .env. Without it the
+# consumer builds the graph but scores nothing. DETEKTIVE_MODEL_DIR points the
+# mount somewhere other than ./models.
+#
 # Another project already on one of those ports? Pick others, on the command
 # line or in a .env file next to this one (kept out of git):
 #   GRAFANA_PORT=3001 PROMETHEUS_PORT=9091 docker compose up -d
@@ -62,6 +67,7 @@ services:
       - |
         rpk topic create payments --partitions 3 -X brokers=redpanda:9092 || true
         rpk topic create payments-dead-letter --partitions 1 -X brokers=redpanda:9092 || true
+        rpk topic create alerts --partitions 1 -X brokers=redpanda:9092 || true
         rpk topic list -X brokers=redpanda:9092
     restart: "no"
 
@@ -89,9 +95,11 @@ services:
     depends_on:
       topics:
         condition: service_completed_successfully
-    command: ["--brokers", "redpanda:9092", "--metrics-addr", "0.0.0.0:9898"]
+    command: ["--brokers", "redpanda:9092", "--metrics-addr", "0.0.0.0:9898", "--model", "${DETEKTIVE_MODEL:-none}"]
     ports:
       - "${METRICS_PORT:-9898}:9898"
+    volumes:
+      - ${DETEKTIVE_MODEL_DIR:-./models}:/models:ro
     restart: unless-stopped
 
   # On demand only: `docker compose run --rm replay [flags]`. Reads the data

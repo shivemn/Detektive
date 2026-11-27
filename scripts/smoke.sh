@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end check of the whole stack with real Redpanda, Prometheus and
 # Grafana: replay a synthetic sample, then confirm the count arrives at every
-# hop. Runs in CI; works locally too (needs docker, curl, python3 with numpy).
+# hop. The consumer scores with the scorer's small test model. Runs in CI; works locally too (needs docker, curl, python3 with numpy).
 #
 #   bash scripts/smoke.sh            # leaves the stack running afterwards
 #   KEEP=0 bash scripts/smoke.sh     # tears it down at the end
@@ -62,6 +62,10 @@ one_consumer_target_up() {
         python3 -c "import json,sys; r=json.load(sys.stdin)['data']['result']; sys.exit(0 if r and float(r[0]['value'][1]) == 1 else 1)"
 }
 
+scored_on_consumer() {
+    curl -fsS localhost:$METRICS_PORT/metrics | grep -qx "detektive_score_payments_total $ROWS"
+}
+
 processed_in_prometheus() {
     curl -fsS -G localhost:$PROMETHEUS_PORT/api/v1/query \
         --data-urlencode 'query=sum(detektive_consumer_messages_total{outcome="processed"})' |
@@ -87,7 +91,8 @@ docker compose build consumer
 log "starting the stack (fresh volumes)"
 docker compose down -v --remove-orphans >/dev/null 2>&1 || true
 docker compose up -d --wait redpanda
-docker compose up -d consumer prometheus grafana
+DETEKTIVE_MODEL=/models DETEKTIVE_MODEL_DIR=./crates/score/tests/fixtures \
+    docker compose up -d consumer prometheus grafana
 
 log "replaying $ROWS synthetic transactions"
 PYTHONPATH=ml/src python3 -m detektive_ml.synthetic "$SAMPLE_DIR/HI-Small_Trans.csv" --rows "$ROWS"
@@ -97,6 +102,7 @@ DETEKTIVE_DATA_DIR=$SAMPLE_DIR docker compose run --rm replay --speed max
 log "following the count through every hop"
 wait_for "consumer handled all $ROWS ($GROUP_HINT)" 90 processed_on_consumer
 wait_for "the graph window accounts for every payment" 10 graph_kept_every_payment
+wait_for "the model scored every payment" 10 scored_on_consumer
 wait_for "Prometheus scrapes exactly one consumer" 30 one_consumer_target_up
 wait_for "Prometheus scraped the same count" 60 processed_in_prometheus
 wait_for "Grafana loaded the dashboard" 60 grafana_has_dashboard
