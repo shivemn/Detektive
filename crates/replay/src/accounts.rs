@@ -1,4 +1,4 @@
-//! Turns "bank:account" strings into dense `u32` ids.
+//! Turns "bank:account" strings, and bank codes, into dense `u32` ids.
 //!
 //! An account number alone is not unique in the IBM data; it is only unique
 //! together with its bank, so the key is both. Ids are handed out in order of
@@ -49,6 +49,42 @@ impl AccountIndex {
     }
 }
 
+/// Bank codes as they appear in the file ("010", "03208"), as dense ids.
+/// Codes are kept as text: "010" and "10" are different banks.
+#[derive(Debug, Default)]
+pub struct BankIndex {
+    ids: HashMap<String, u32>,
+    codes: Vec<String>,
+}
+
+impl BankIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn intern(&mut self, code: &str) -> u32 {
+        if let Some(&id) = self.ids.get(code) {
+            return id;
+        }
+        let id = u32::try_from(self.codes.len()).expect("more than 4 billion banks");
+        self.codes.push(code.to_owned());
+        self.ids.insert(code.to_owned(), id);
+        id
+    }
+
+    pub fn code(&self, id: u32) -> Option<&str> {
+        self.codes.get(id as usize).map(String::as_str)
+    }
+
+    pub fn len(&self) -> usize {
+        self.codes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.codes.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +103,16 @@ mod tests {
     fn same_account_number_at_different_banks_is_different() {
         let mut index = AccountIndex::new();
         assert_ne!(index.intern("001", "ABC"), index.intern("002", "ABC"));
+    }
+
+    #[test]
+    fn banks_are_kept_as_written() {
+        let mut banks = BankIndex::new();
+        let a = banks.intern("010");
+        assert_eq!(banks.intern("010"), a);
+        assert_ne!(banks.intern("10"), a);
+        assert_eq!(banks.code(a), Some("010"));
+        assert_eq!(banks.len(), 2);
     }
 
     #[test]

@@ -41,6 +41,8 @@ fn transactions(n: u32) -> Vec<Transaction> {
             ts: 1_661_990_400 + i64::from(i) * 60,
             src: i % 97,
             dst: (i * 7 + 3) % 131,
+            src_bank: i % 5,
+            dst_bank: (i * 3) % 5,
             amount_paid: 100.0 + f64::from(i),
             paid_currency: Currency::Euro,
             amount_received: 100.0 + f64::from(i),

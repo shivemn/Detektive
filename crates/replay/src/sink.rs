@@ -66,6 +66,8 @@ mod tests {
             ts: 0,
             src: 0,
             dst: 1,
+            src_bank: 0,
+            dst_bank: 0,
             amount_paid: 1.5,
             paid_currency: Currency::Euro,
             amount_received: 1.5,

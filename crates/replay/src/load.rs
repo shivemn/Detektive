@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::NaiveDate;
 
-use crate::accounts::AccountIndex;
+use crate::accounts::{AccountIndex, BankIndex};
 use crate::model::{Currency, PaymentFormat, Transaction};
 
 const COLUMNS: usize = 11;
@@ -16,6 +16,7 @@ pub struct Dataset {
     /// Sorted by (timestamp, tx_id): the order a live stream would deliver.
     pub transactions: Vec<Transaction>,
     pub accounts: AccountIndex,
+    pub banks: BankIndex,
 }
 
 pub fn load_csv(path: &Path) -> Result<Dataset> {
@@ -28,13 +29,14 @@ pub fn from_reader<R: Read>(reader: R) -> Result<Dataset> {
         .has_headers(true)
         .from_reader(reader);
     let mut accounts = AccountIndex::new();
+    let mut banks = BankIndex::new();
     let mut transactions = Vec::new();
 
     // one record buffer reused for every row instead of allocating per row
     let mut record = csv::StringRecord::new();
     let mut row: u32 = 0;
     while csv.read_record(&mut record)? {
-        let tx = parse_row(&record, row, &mut accounts)
+        let tx = parse_row(&record, row, &mut accounts, &mut banks)
             .with_context(|| format!("row {} (line {})", row, row + 2))?;
         transactions.push(tx);
         row += 1;
@@ -45,6 +47,7 @@ pub fn from_reader<R: Read>(reader: R) -> Result<Dataset> {
     Ok(Dataset {
         transactions,
         accounts,
+        banks,
     })
 }
 
@@ -52,6 +55,7 @@ fn parse_row(
     r: &csv::StringRecord,
     tx_id: u32,
     accounts: &mut AccountIndex,
+    banks: &mut BankIndex,
 ) -> Result<Transaction> {
     if r.len() != COLUMNS {
         bail!("expected {COLUMNS} columns, found {}", r.len());
@@ -63,6 +67,8 @@ fn parse_row(
         ts: parse_timestamp(field(0))?,
         src: accounts.intern(field(1), field(2)),
         dst: accounts.intern(field(3), field(4)),
+        src_bank: banks.intern(field(1)),
+        dst_bank: banks.intern(field(3)),
         amount_received: parse_amount(field(5))?,
         received_currency: Currency::parse(field(6))
             .ok_or_else(|| anyhow!("unknown currency {:?}", field(6)))?,
@@ -150,6 +156,9 @@ mod tests {
         let cheque = data.transactions.iter().find(|t| t.tx_id == 1).unwrap();
         assert_eq!(data.accounts.key(cheque.src), Some("3208:8000F4580"));
         assert_eq!(data.accounts.key(cheque.dst), Some("001:8000F5340"));
+        assert_eq!(data.banks.code(cheque.src_bank), Some("3208"));
+        assert_eq!(data.banks.code(cheque.dst_bank), Some("001"));
+        assert_eq!(t.src_bank, t.dst_bank, "row 4 pays within bank 010");
     }
 
     #[test]

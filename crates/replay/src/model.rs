@@ -48,6 +48,27 @@ impl Currency {
         })
     }
 
+    /// The name as the IBM files spell it; the inverse of `parse`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::UsDollar => "US Dollar",
+            Self::Euro => "Euro",
+            Self::UkPound => "UK Pound",
+            Self::SwissFranc => "Swiss Franc",
+            Self::Yuan => "Yuan",
+            Self::Rupee => "Rupee",
+            Self::Yen => "Yen",
+            Self::Ruble => "Ruble",
+            Self::CanadianDollar => "Canadian Dollar",
+            Self::AustralianDollar => "Australian Dollar",
+            Self::SaudiRiyal => "Saudi Riyal",
+            Self::Shekel => "Shekel",
+            Self::MexicanPeso => "Mexican Peso",
+            Self::BrazilReal => "Brazil Real",
+            Self::Bitcoin => "Bitcoin",
+        }
+    }
+
     /// Every currency in the IBM files.
     pub const ALL: [Self; 15] = [
         Self::UsDollar,
@@ -119,6 +140,19 @@ impl PaymentFormat {
         })
     }
 
+    /// The name as the IBM files spell it; the inverse of `parse`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ach => "ACH",
+            Self::Cheque => "Cheque",
+            Self::CreditCard => "Credit Card",
+            Self::Cash => "Cash",
+            Self::Wire => "Wire",
+            Self::Reinvestment => "Reinvestment",
+            Self::Bitcoin => "Bitcoin",
+        }
+    }
+
     /// Every payment format in the IBM files.
     pub const ALL: [Self; 7] = [
         Self::Ach,
@@ -163,6 +197,9 @@ pub struct Transaction {
     pub ts: i64,
     pub src: u32,
     pub dst: u32,
+    /// Ids of the sender's and receiver's banks (see `accounts::BankIndex`).
+    pub src_bank: u32,
+    pub dst_bank: u32,
     pub amount_paid: f64,
     pub paid_currency: Currency,
     pub amount_received: f64,
@@ -180,6 +217,10 @@ mod tests {
         }
         for f in PaymentFormat::ALL {
             assert_eq!(PaymentFormat::from_code(f.as_str()), Some(f));
+            assert_eq!(PaymentFormat::parse(f.name()), Some(f));
+        }
+        for c in Currency::ALL {
+            assert_eq!(Currency::parse(c.name()), Some(c));
         }
         assert_eq!(Currency::from_code("XYZ"), None);
         assert_eq!(
