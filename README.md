@@ -10,14 +10,16 @@ arrives. Every alert says which pattern it matched and why.
 The engine will be written in Rust. Models are trained in Python and served
 from Rust through ONNX.
 
-> **Status: week 10 of about 24.** What exists today is the data pipeline, the
+> **Status: week 11 of about 24.** What exists today is the data pipeline, the
 > evaluation protocol, a floor baseline, a Rust replayer that streams the data
 > in time order, a consumer service reading that stream from Redpanda,
-> Prometheus metrics with a Grafana dashboard, the graph engine's features
+> Prometheus metrics with a Grafana dashboard, and the graph engine's features
 > (a time-windowed payment graph with per-partition watermarks; degree and fan
 > features, temporal cycles and their shape, scatter-gather and gather-scatter
-> for every payment), and boosted-tree models trained on them. The models are
-> not yet scored inside the stream.
+> for every payment). On top of those sit a boosted-tree model trained on the
+> features and exported to ONNX, and a Rust scorer that runs it on every
+> payment in the stream and publishes alerts. Alerts do not yet explain
+> themselves.
 
 ## Data
 
@@ -114,6 +116,29 @@ byte for byte on all of HI-Small. Every structural feature also matches
 NetworkX exactly. Design, measurements and tests:
 [docs/graph-engine.md](docs/graph-engine.md).
 
+## Scoring
+
+The model is exported from Python to ONNX and run by `crates/score`, which
+walks the trees itself:
+
+- **It matches LightGBM.** On all 5,078,345 HI-Small payments its scores agree
+  with LightGBM's to within 6 × 10⁻⁸, with no alert decision different.
+  Getting there meant fixing how the export rounds split thresholds.
+- **It is fast.** About 14 µs per payment for the model (p99 34 µs), and 21 µs
+  with the graph (p99 63 µs), on one core.
+
+The consumer scores every payment and writes alerts to an `alerts` topic. Each
+alert is confirmed before its payment's offset is stored.
+
+At a review budget of 100 alerts a day, 78% of the model's alerts are
+laundering, and it catches 20.5% of the test period's laundering. Hand-written
+rules on the same graph patterns manage 22% and 5.8%.
+
+38% of HI-Small's laundering belongs to no pattern IBM lists, and the model
+catches almost none of it. That caps recall at about 60% for features like
+these. Details, timings and the validation-to-test gap:
+[docs/scoring.md](docs/scoring.md).
+
 ## Running it
 
 Python needs 3.10+; Rust needs a stable toolchain (`rustup`). The Redpanda
@@ -145,6 +170,11 @@ bash scripts/check_features.sh       # features against a brute-force recount
 
 # boosted trees on row + graph features (about 6 GB of memory)
 cd ml && python -m detektive_ml.models.graph_boost ../data/processed/hi_small.parquet ../features.csv
+
+# the model the stream runs: export it, then score the whole file in Rust
+python -m detektive_ml.models.export ../data/processed/hi_small.parquet ../features.csv ../models --scores
+cd .. && cargo run --release -p detektive-score -- data/raw/HI-Small_Trans.csv --model models
+DETEKTIVE_MODEL=/models docker compose up -d   # the consumer scores and alerts
 ```
 
 No dataset yet? `python -m detektive_ml.synthetic sample.csv` writes a small
@@ -154,11 +184,13 @@ fake file in the same format, good enough to check the pipeline runs.
 
 ```
 crates/    Rust: replay (the payment stream), consumer (reads it from Redpanda),
-           graph (the time-windowed graph and its features)
+           graph (the time-windowed graph and its features), score (runs
+           the exported model)
 observability/  Prometheus config, Grafana provisioning and dashboard
 ml/        Python: data loading, time split, evaluation, baselines, models
 docs/      design notes and the evaluation protocol
 data/      datasets (not committed)
+models/    trained models (not committed)
 results/   one JSON file per experiment (not committed)
 ```
 
