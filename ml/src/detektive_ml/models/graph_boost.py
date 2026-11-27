@@ -47,6 +47,8 @@ class Matrix:
     test: slice
     tail: np.ndarray | None
     info: dict
+    # the integer code of each category value, learned on training rows
+    categories: dict[str, dict[str, int]]
 
 
 def join_graph(df: pl.DataFrame, graph_csv: Path) -> tuple[pl.DataFrame, list[str]]:
@@ -72,12 +74,14 @@ def build(df: pl.DataFrame, graph_names: list[str], which: str) -> Matrix:
     n = df.height
 
     columns: list[pl.Series] = []
+    categories: dict[str, dict[str, int]] = {}
     if which in ("row", "both"):
         rows = row_features(df)
         # categorical codes learned on training rows only; unseen values become -1
         for c in CATEGORICAL:
             seen = rows[c].head(a).unique().sort().to_list()
             mapping = {v: i for i, v in enumerate(seen)}
+            categories[c] = mapping
             rows = rows.with_columns(pl.col(c).replace_strict(mapping, default=-1, return_dtype=pl.Int32))
         columns += rows.get_columns()
     if which in ("graph", "both"):
@@ -92,7 +96,8 @@ def build(df: pl.DataFrame, graph_names: list[str], which: str) -> Matrix:
     tail = ts[b:] >= np.datetime64(tail_start) if tail_start else None
     info = split.summary()
     info["sparse_tail_start"] = str(tail_start) if tail_start else None
-    return Matrix(X, df["is_laundering"].to_numpy().astype(np.int8), names, slice(0, a), slice(a, b), slice(b, n), tail, info)
+    y = df["is_laundering"].to_numpy().astype(np.int8)
+    return Matrix(X, y, names, slice(0, a), slice(a, b), slice(b, n), tail, info, categories)
 
 
 def fit_xgb(m: Matrix, seed: int, weight: float):
@@ -126,7 +131,8 @@ def fit_xgb(m: Matrix, seed: int, weight: float):
     return predict, best[1], {k: float(v) for k, v in gain.items()}
 
 
-def fit_lgbm(m: Matrix, seed: int, weight: float):
+def train_lgbm(m: Matrix, seed: int, weight: float = 1.0):
+    """The LightGBM booster with the settings chosen on validation."""
     import lightgbm as lgb
 
     train = lgb.Dataset(m.X[m.train], m.y[m.train], feature_name=m.names, free_raw_data=True)
@@ -145,8 +151,12 @@ def fit_lgbm(m: Matrix, seed: int, weight: float):
         "seed": seed,
         "verbose": -1,
     }
-    booster = lgb.train(params, train, num_boost_round=3000, valid_sets=[val],
-                        callbacks=[lgb.early_stopping(200, verbose=False)])
+    return lgb.train(params, train, num_boost_round=3000, valid_sets=[val],
+                     callbacks=[lgb.early_stopping(200, verbose=False)])
+
+
+def fit_lgbm(m: Matrix, seed: int, weight: float):
+    booster = train_lgbm(m, seed, weight)
 
     def predict(part: slice) -> np.ndarray:
         return booster.predict(m.X[part], num_iteration=booster.best_iteration)

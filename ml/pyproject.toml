@@ -11,6 +11,9 @@ dependencies = [
     "xgboost>=2.0",
     "networkx>=3.2",
     "lightgbm>=4.0",
+    "onnx>=1.15",
+    "onnxmltools>=1.12",
+    "onnxruntime>=1.17",
 ]
 
 [project.optional-dependencies]
