@@ -1,0 +1,4 @@
+# The scorer's test fixtures are compared byte for byte and number for number,
+# so keep them exactly as committed on every platform.
+*.onnx binary
+crates/score/tests/fixtures/* -text
