@@ -68,6 +68,8 @@ async fn events_through_the_mock_cluster() {
         idle_timeout: Some(Duration::from_secs(15)),
         report_every: Duration::from_secs(600),
         graph: Default::default(),
+        model: None,
+        alerts_topic: None,
     };
     let summary = run(
         cfg,

@@ -14,6 +14,12 @@ pub struct PaymentEvent<'a> {
     pub ts: i64,
     pub src: u32,
     pub dst: u32,
+    /// Sender's and receiver's bank. Events written before the replayer
+    /// carried them have neither.
+    #[serde(default)]
+    pub src_bank: Option<u32>,
+    #[serde(default)]
+    pub dst_bank: Option<u32>,
     pub amount: f64,
     #[serde(borrow)]
     pub currency: Cow<'a, str>,

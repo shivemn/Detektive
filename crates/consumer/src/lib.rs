@@ -1,5 +1,7 @@
-//! Reads the `payments` topic, decodes each event, keeps running counts and
-//! adds every new payment to the time-windowed graph (`detektive-graph`).
+//! Reads the `payments` topic, decodes each event, keeps running counts,
+//! adds every new payment to the time-windowed graph (`detektive-graph`) and,
+//! with a model loaded, scores it (`detektive-score`). A payment that reaches
+//! the model's threshold is logged and written to an alerts topic.
 //!
 //! Delivery is at-least-once, built from three rules:
 //!
@@ -10,6 +12,11 @@
 //!    reason attached, and only then is its offset stored. One bad message
 //!    never stops the stream, and it is never silently dropped.
 //! 3. Repeats are recognised by `tx_id` and skipped (see `state.rs`).
+//!
+//! Alerts follow the same rule as dead letters: the broker must confirm an
+//! alert before the payment's offset is stored. After a crash an alert can
+//! therefore be written twice, never lost; whoever reads the alerts topic
+//! should key on `tx_id`.
 
 pub mod bitset;
 pub mod event;
@@ -21,6 +28,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use detektive_graph::Observation;
+use detektive_score::Model;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
@@ -29,7 +38,7 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use tracing::{info, warn};
 
 use crate::metrics::{Assignment, Metrics, MetricsContext};
-use crate::state::{Outcome, State};
+use crate::state::{Outcome, Scored, State};
 
 pub use crate::state::GraphSettings;
 
@@ -46,6 +55,10 @@ pub struct Config {
     pub idle_timeout: Option<Duration>,
     pub report_every: Duration,
     pub graph: GraphSettings,
+    /// Score payments with this model. `None` builds the graph only.
+    pub model: Option<Model>,
+    /// Where alerts go. `None` only logs them.
+    pub alerts_topic: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +79,9 @@ pub struct Summary {
     pub evicted: u64,
     /// Payments already older than the window when they arrived.
     pub too_late: u64,
+    /// Payments the model scored, and how many of them alerted.
+    pub scored: u64,
+    pub alerts: u64,
     /// From the first message to the last: the time spent actually consuming,
     /// without the group join before it or the idle wait after it.
     pub busy: Duration,
@@ -106,19 +122,32 @@ pub async fn run(
         .with_context(|| format!("connecting consumer to {}", cfg.brokers))?;
     consumer.subscribe(&[&cfg.topic]).context("subscribing")?;
 
-    let dead_letters: Option<FutureProducer> = match &cfg.dead_letter_topic {
-        Some(_) => Some(
-            ClientConfig::new()
-                .set("bootstrap.servers", &cfg.brokers)
-                .set("enable.idempotence", "true")
-                .create()
-                .context("creating dead-letter producer")?,
-        ),
-        None => None,
-    };
+    // one producer for dead letters and alerts, if either has a topic
+    let producer: Option<FutureProducer> =
+        if cfg.dead_letter_topic.is_some() || cfg.alerts_topic.is_some() {
+            Some(
+                ClientConfig::new()
+                    .set("bootstrap.servers", &cfg.brokers)
+                    .set("enable.idempotence", "true")
+                    .create()
+                    .context("creating producer for dead letters and alerts")?,
+            )
+        } else {
+            None
+        };
 
     info!(topic = %cfg.topic, group = %cfg.group, "consuming");
     let mut state = State::new(cfg.graph);
+    if let Some(model) = cfg.model.clone() {
+        info!(
+            trees = model.forest().trees(),
+            threshold = model.threshold(),
+            trained = model.card().created_utc.as_deref().unwrap_or("unknown"),
+            "scoring with model"
+        );
+        metrics.threshold.set(model.threshold());
+        state = state.with_model(model);
+    }
     let mut dead_lettered = 0u64;
     let mut progress = Progress::new();
     let mut first_message: Option<Instant> = None;
@@ -172,7 +201,7 @@ pub async fn run(
                 let outcome = state.handle(partition, message.payload(), last_message);
                 metrics.handle_time.observe(last_message.elapsed().as_secs_f64());
                 match outcome {
-                    Outcome::Processed { lateness, behind_partition, observation, .. } => {
+                    Outcome::Processed { lateness, behind_partition, observation, scored, .. } => {
                         metrics.messages.with_label_values(&["processed"]).inc();
                         metrics.event_lateness.observe(lateness as f64);
                         if lateness > 0 {
@@ -180,6 +209,21 @@ pub async fn run(
                         }
                         if behind_partition > 0 {
                             metrics.behind_partition.with_label_values(&[&partition.to_string()]).inc();
+                        }
+                        if let (Some(s), Some(o)) = (scored, &observation) {
+                            metrics.scored.inc();
+                            metrics.score.observe(s.score);
+                            metrics.score_time.observe(s.took.as_secs_f64());
+                            if s.alert {
+                                metrics.alerts.inc();
+                                let threshold = state.model.as_ref().map_or(1.0, Model::threshold);
+                                let alert = alert_json(&message, o, s, threshold);
+                                warn!(tx = o.tx, score = format!("{:.3}", s.score), threshold = format!("{threshold:.3}"), "alert");
+                                if let (Some(producer), Some(topic)) = (&producer, &cfg.alerts_topic) {
+                                    publish_alert(producer, topic, o.tx, &alert).await?;
+                                    metrics.alerts_published.inc();
+                                }
+                            }
                         }
                         if let Some(o) = observation {
                             let f = o.features;
@@ -220,7 +264,7 @@ pub async fn run(
                     Outcome::Bad(reason) => {
                         metrics.messages.with_label_values(&["bad"]).inc();
                         let reason = reason.to_string();
-                        match (&dead_letters, &cfg.dead_letter_topic) {
+                        match (&producer, &cfg.dead_letter_topic) {
                             (Some(producer), Some(topic)) => {
                                 dead_letter(producer, topic, &message, &reason).await?;
                                 dead_lettered += 1;
@@ -253,6 +297,8 @@ pub async fn run(
         window_edges: graph.edges,
         evicted: graph.evicted,
         too_late: graph.too_late,
+        scored: metrics.scored.get(),
+        alerts: state.alerts,
         processed: state.processed,
         duplicates: state.duplicates,
         bad: state.bad,
@@ -294,6 +340,48 @@ fn end_to_end_latency(ts: Timestamp) -> Option<f64> {
         .ok()?
         .as_millis() as i64;
     Some((now_ms - created_ms).max(0) as f64 / 1000.0)
+}
+
+/// What an alert says: the payment, its score, and the graph facts behind it.
+/// The facts are the features as computed, not an explanation of the score;
+/// explaining the model is a later step.
+fn alert_json(msg: &BorrowedMessage<'_>, o: &Observation, s: Scored, threshold: f64) -> String {
+    let f = &o.features;
+    let payment: serde_json::Value = msg
+        .payload()
+        .and_then(|p| serde_json::from_slice(p).ok())
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "tx_id": o.tx,
+        "score": s.score,
+        "threshold": threshold,
+        "payment": payment,
+        "graph": {
+            "pair_count": f.pair_count,
+            "sender_fan_out": f.src_fan_out,
+            "receiver_fan_in": f.dst_fan_in,
+            "cycles": f.cycles,
+            "shortest_cycle": f.shortest_cycle,
+            "ring_repeats": f.ring_repeats,
+            "scatter_gather": f.scatter_gather,
+            "ring": o.cycles.example.iter().map(|h| h.src).collect::<Vec<_>>(),
+        },
+    })
+    .to_string()
+}
+
+/// Write an alert, keyed by tx_id, and wait for the broker to confirm it.
+async fn publish_alert(producer: &FutureProducer, topic: &str, tx: u32, alert: &str) -> Result<()> {
+    let key = tx.to_string();
+    producer
+        .send(
+            FutureRecord::to(topic).key(&key).payload(alert),
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|(e, _)| e)
+        .context("writing to the alerts topic")?;
+    Ok(())
 }
 
 /// Copy a bad message to the dead-letter topic, with where it came from and

@@ -7,7 +7,9 @@
 //!
 //! Every new payment goes into the time-windowed graph. The window moves with
 //! the watermark, the slowest partition's clock, so a partition that is
-//! behind never has its payments evicted before they arrive.
+//! behind never has its payments evicted before they arrive. With a model
+//! loaded, each payment is then scored on its row and graph features, and
+//! alerts when its score reaches the model's threshold.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -18,6 +20,7 @@ use detektive_graph::{
 
 use detektive_replay::india;
 use detektive_replay::model::{Currency, PaymentFormat};
+use detektive_score::{Model, Row};
 
 use crate::bitset::BitSet;
 use crate::event::{DecodeError, decode};
@@ -36,9 +39,22 @@ pub enum Outcome {
         /// The payment's features and the cycles it closes, read from the
         /// window right after it went in. `None` if it was too late to go in.
         observation: Option<Observation>,
+        /// The model's verdict, when a model is loaded and the payment made
+        /// it into the window.
+        scored: Option<Scored>,
     },
     Duplicate,
     Bad(DecodeError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Scored {
+    /// Probability of laundering, as the model sees it.
+    pub score: f64,
+    /// The score reached the model's alert threshold.
+    pub alert: bool,
+    /// Time spent in the model alone.
+    pub took: Duration,
 }
 
 /// How much event time the graph keeps, how far cycle searches go, and when
@@ -84,6 +100,8 @@ pub struct State {
     pub by_format: BTreeMap<String, u64>,
     pub watermarks: Watermarks,
     pub engine: Engine,
+    pub model: Option<Model>,
+    pub alerts: u64,
 }
 
 impl Default for State {
@@ -111,7 +129,15 @@ impl State {
                 cycle_budget: settings.cycle_budget,
                 scatter_gather_budget: settings.scatter_gather_budget,
             }),
+            model: None,
+            alerts: 0,
         }
+    }
+
+    /// Score every payment with this model from now on.
+    pub fn with_model(mut self, model: Model) -> Self {
+        self.model = Some(model);
+        self
     }
 
     /// Handle one message from `partition`, read at `now`.
@@ -142,7 +168,8 @@ impl State {
             }
         };
         self.max_lateness = self.max_lateness.max(lateness);
-        let format = PaymentFormat::from_code(&event.format).map_or(u8::MAX, |f| f as u8);
+        let parsed_format = PaymentFormat::from_code(&event.format);
+        let format = parsed_format.map_or(u8::MAX, |f| f as u8);
         // only allocates the first time a format is seen
         match self.by_format.get_mut(event.format.as_ref()) {
             Some(n) => *n += 1,
@@ -169,11 +196,35 @@ impl State {
             format,
         };
         let observation = self.engine.add(payment);
+        let scored = match (&self.model, &observation) {
+            (Some(model), Some(obs)) => {
+                let row = Row {
+                    ts: event.ts,
+                    src: event.src,
+                    dst: event.dst,
+                    src_bank: event.src_bank,
+                    dst_bank: event.dst_bank,
+                    amount_paid: event.amount,
+                    paid_currency: Currency::from_code(&event.currency),
+                    amount_received: event.received_amount,
+                    received_currency: Currency::from_code(&event.received_currency),
+                    format: parsed_format,
+                };
+                let clock = Instant::now();
+                let score = model.score(&row, &obs.features);
+                let took = clock.elapsed();
+                let alert = score >= model.threshold();
+                self.alerts += u64::from(alert);
+                Some(Scored { score, alert, took })
+            }
+            _ => None,
+        };
         Outcome::Processed {
             lateness,
             behind_partition,
             too_late: observation.is_none(),
             observation,
+            scored,
         }
     }
 
@@ -219,6 +270,7 @@ mod tests {
             behind_partition: 0,
             too_late: false,
             observation: None,
+            scored: None,
         }
     }
 
@@ -235,6 +287,7 @@ mod tests {
                 behind_partition,
                 too_late,
                 observation: None,
+                scored: None,
             },
             other => other,
         }
@@ -305,6 +358,7 @@ mod tests {
                 behind_partition: 60,
                 too_late: false,
                 observation: None,
+                scored: None,
             }
         );
         assert_eq!(s.behind_partition(), 1);
@@ -383,5 +437,101 @@ mod tests {
         assert!(matches!(handle(&mut s, Some(b"garbage")), Outcome::Bad(_)));
         assert_eq!(handle(&mut s, None), Outcome::Bad(DecodeError::Empty));
         assert_eq!((s.bad, s.processed), (2, 0));
+    }
+
+    fn fixture_model() -> Model {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../score/tests/fixtures");
+        Model::load(&dir).expect("the scorer's test model")
+    }
+
+    #[test]
+    fn with_a_model_every_payment_in_the_window_is_scored() {
+        let mut s = State::default().with_model(fixture_model());
+        let now = Instant::now();
+        let mut scores = Vec::new();
+        for i in 0..50u32 {
+            let e = event(
+                i,
+                60 * i64::from(i),
+                i % 7,
+                (i * 3) % 11,
+                ["ach", "wire", "cheque"][i as usize % 3],
+            );
+            let Outcome::Processed {
+                scored: Some(scored),
+                observation: Some(_),
+                ..
+            } = s.handle(0, Some(&e), now)
+            else {
+                panic!("payment {i} was not scored");
+            };
+            assert!((0.0..=1.0).contains(&scored.score));
+            assert_eq!(
+                scored.alert,
+                scored.score >= s.model.as_ref().unwrap().threshold()
+            );
+            scores.push(scored.score);
+        }
+        assert_eq!(
+            s.alerts,
+            scores
+                .iter()
+                .filter(|&&x| x >= s.model.as_ref().unwrap().threshold())
+                .count() as u64
+        );
+        assert!(
+            scores.windows(2).any(|w| w[0] != w[1]),
+            "the features should move the score"
+        );
+    }
+
+    #[test]
+    fn the_stream_scores_as_the_scorer_does() {
+        // the consumer builds the row from the event; the batch tool from the
+        // file. Same payment, same score.
+        let model = fixture_model();
+        let mut s = State::default().with_model(model.clone());
+        let e = br#"{"tx_id":1,"ts":1661991600,"src":4,"dst":8,"src_bank":2,"dst_bank":2,"amount":351.0,"currency":"EUR","received_amount":351.0,"received_currency":"USD","format":"ach"}"#;
+        let Outcome::Processed {
+            scored: Some(scored),
+            observation: Some(o),
+            ..
+        } = s.handle(0, Some(e), Instant::now())
+        else {
+            panic!("not scored");
+        };
+        let row = Row {
+            ts: 1_661_991_600,
+            src: 4,
+            dst: 8,
+            src_bank: Some(2),
+            dst_bank: Some(2),
+            amount_paid: 351.0,
+            paid_currency: Some(Currency::Euro),
+            amount_received: 351.0,
+            received_currency: Some(Currency::UsDollar),
+            format: Some(PaymentFormat::Ach),
+        };
+        assert_eq!(scored.score, model.score(&row, &o.features));
+    }
+
+    #[test]
+    fn a_payment_too_late_for_the_window_is_not_scored() {
+        let mut s = State::new(GraphSettings {
+            window: Duration::from_secs(60),
+            ..GraphSettings::default()
+        })
+        .with_model(fixture_model());
+        let now = Instant::now();
+        s.handle(0, Some(&event(0, 1000, 1, 2, "ach")), now);
+        let outcome = s.handle(1, Some(&event(1, 900, 1, 2, "ach")), now);
+        assert!(matches!(
+            outcome,
+            Outcome::Processed {
+                too_late: true,
+                scored: None,
+                ..
+            }
+        ));
     }
 }

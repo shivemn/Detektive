@@ -58,7 +58,11 @@ fn transactions(n: u32) -> Vec<Transaction> {
 }
 
 fn publish(brokers: &str, txs: &[Transaction]) {
-    let mut sink = KafkaSink::new(brokers, TOPIC).unwrap();
+    publish_to(brokers, TOPIC, txs);
+}
+
+fn publish_to(brokers: &str, topic: &str, txs: &[Transaction]) {
+    let mut sink = KafkaSink::new(brokers, topic).unwrap();
     let opts = ReplayOptions {
         speed: Speed::Max,
         limit: None,
@@ -78,6 +82,8 @@ fn config(brokers: &str, group: &str) -> Config {
         idle_timeout: Some(Duration::from_secs(5)),
         report_every: Duration::from_secs(60),
         graph: Default::default(),
+        model: None,
+        alerts_topic: None,
     }
 }
 
@@ -378,4 +384,76 @@ async fn metrics_endpoint_reports_what_the_consumer_did() {
         })
         .collect();
     assert_eq!(lag, vec![0.0, 0.0, 0.0], "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alerts_reach_the_alerts_topic_and_match_lightgbm() {
+    // the scorer's fixture: a synthetic file, a model trained on it, and
+    // LightGBM's score for every payment
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../score/tests/fixtures");
+    let data = detektive_replay::load::load_csv(&fixtures.join("sample.csv")).unwrap();
+    let model = detektive_score::Model::load(&fixtures).unwrap();
+    let threshold = model.threshold();
+    let lightgbm: Vec<(u32, f64)> = std::fs::read_to_string(fixtures.join("scores.csv"))
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|l| {
+            let (id, score) = l.split_once(',').unwrap();
+            (id.parse().unwrap(), score.parse().unwrap())
+        })
+        .collect();
+
+    // one partition, so payments arrive in time order and see exactly the
+    // graph the batch tool saw
+    let cluster = MockCluster::new(1).unwrap();
+    cluster.create_topic("payments-one", 1, 1).unwrap();
+    cluster.create_topic("alerts", 1, 1).unwrap();
+    let brokers = cluster.bootstrap_servers();
+    publish_to(&brokers, "payments-one", &data.transactions);
+
+    let summary = consume(Config {
+        topic: "payments-one".to_owned(),
+        stop_after: Some(data.transactions.len() as u64),
+        model: Some(model),
+        alerts_topic: Some("alerts".to_owned()),
+        ..config(&brokers, "scoring")
+    })
+    .await;
+    assert_eq!(summary.scored, data.transactions.len() as u64);
+    assert!(summary.alerts > 0);
+
+    let reader: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .set("group.id", "alerts-reader")
+        .set("auto.offset.reset", "earliest")
+        .create()
+        .unwrap();
+    reader.subscribe(&["alerts"]).unwrap();
+    let mut alerted = HashSet::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if let Some(Ok(m)) = reader.poll(Duration::from_millis(100)) {
+            let alert: serde_json::Value = serde_json::from_slice(m.payload().unwrap()).unwrap();
+            assert!(alert["score"].as_f64().unwrap() >= threshold);
+            assert_eq!(alert["payment"]["tx_id"], alert["tx_id"]);
+            alerted.insert(alert["tx_id"].as_u64().unwrap() as u32);
+            if alerted.len() as u64 == summary.alerts {
+                break;
+            }
+        }
+    }
+    assert_eq!(alerted.len() as u64, summary.alerts);
+
+    // the same payments LightGBM would alert on, apart from any sitting
+    // exactly on the threshold
+    for (tx, score) in lightgbm {
+        if (score - threshold).abs() > 1e-6 {
+            assert_eq!(
+                alerted.contains(&tx),
+                score >= threshold,
+                "payment {tx}, LightGBM score {score}"
+            );
+        }
+    }
 }

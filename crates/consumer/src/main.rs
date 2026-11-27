@@ -9,8 +9,10 @@ use tracing_subscriber::EnvFilter;
 
 use detektive_consumer::metrics::{self, Metrics};
 use detektive_consumer::{Config, GraphSettings, run};
+use detektive_score::Model;
 
-/// Consume the payments stream from Redpanda and keep running counts.
+/// Consume the payments stream from Redpanda, build the payment graph and,
+/// with a model, score every payment.
 #[derive(Parser)]
 #[command(version)]
 struct Args {
@@ -67,6 +69,15 @@ struct Args {
     /// watermark back
     #[arg(long, default_value_t = 10)]
     idle_partition_secs: u64,
+
+    /// Directory with model.onnx and model.json (see docs/scoring.md);
+    /// "none" puts payments into the graph without scoring them
+    #[arg(long, default_value = "none")]
+    model: String,
+
+    /// Topic for alerts ("none" to only log them)
+    #[arg(long, default_value = "alerts")]
+    alerts_topic: String,
 }
 
 #[tokio::main]
@@ -80,6 +91,12 @@ async fn main() -> Result<()> {
         .with_ansi(std::io::stdout().is_terminal())
         .init();
     let args = Args::parse();
+    let model = match args.model.as_str() {
+        "none" => None,
+        dir => {
+            Some(Model::load(dir.as_ref()).with_context(|| format!("loading the model in {dir}"))?)
+        }
+    };
 
     let cfg = Config {
         brokers: args.brokers,
@@ -96,6 +113,8 @@ async fn main() -> Result<()> {
             scatter_gather_budget: args.scatter_gather_budget,
             idle_partition: Duration::from_secs(args.idle_partition_secs),
         },
+        model,
+        alerts_topic: (args.alerts_topic != "none").then_some(args.alerts_topic),
     };
     let metrics = Arc::new(Metrics::new()?);
     if args.metrics_addr != "none" {
@@ -127,5 +146,13 @@ async fn main() -> Result<()> {
         "graph window: {} payments now, {} evicted, {} too late to add",
         summary.window_edges, summary.evicted, summary.too_late
     );
+    if summary.scored > 0 {
+        eprintln!(
+            "scored {} payments, {} alerts ({:.3}%)",
+            summary.scored,
+            summary.alerts,
+            summary.alerts as f64 * 100.0 / summary.scored as f64
+        );
+    }
     Ok(())
 }

@@ -12,7 +12,9 @@
 //!   time window open for stragglers.
 //!
 //! The `detektive_graph_*` metrics describe the time-windowed graph: how much
-//! it holds, how much it evicts, and where its watermark is.
+//! it holds, how much it evicts, and where its watermark is. The
+//! `detektive_score_*` metrics describe the model: what it scores, how long
+//! that takes, and how often it alerts.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,8 +26,8 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+    Encoder, Gauge, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    Opts, Registry, TextEncoder,
 };
 use rdkafka::ClientContext;
 use rdkafka::consumer::{ConsumerContext, Rebalance};
@@ -64,6 +66,12 @@ pub struct Metrics {
     pub live_cycles: IntGauge,
     pub scatter_gather: Histogram,
     pub scatter_gather_truncated: IntCounter,
+    pub scored: IntCounter,
+    pub alerts: IntCounter,
+    pub alerts_published: IntCounter,
+    pub score: Histogram,
+    pub score_time: Histogram,
+    pub threshold: Gauge,
 }
 
 impl Metrics {
@@ -120,10 +128,11 @@ impl Metrics {
             handle_time: Histogram::with_opts(
                 HistogramOpts::new(
                     "detektive_consumer_handle_seconds",
-                    "Time to decode and count one message",
+                    "Time to handle one message: decode it, add it to the graph and score it",
                 )
                 .buckets(vec![
-                    1e-6, 2.5e-6, 5e-6, 1e-5, 2.5e-5, 5e-5, 1e-4, 2.5e-4, 1e-3, 1e-2,
+                    1e-6, 2.5e-6, 5e-6, 1e-5, 2.5e-5, 5e-5, 1e-4, 2.5e-4, 5e-4, 1e-3, 2.5e-3, 5e-3,
+                    1e-2, 0.1,
                 ]),
             )?,
             watermark: IntGauge::new(
@@ -201,6 +210,41 @@ impl Metrics {
                 "detektive_graph_scatter_gather_truncated_total",
                 "Scatter-gather searches stopped at their budget (there may have been a wider one)",
             )?,
+            scored: IntCounter::new(
+                "detektive_score_payments_total",
+                "Payments the model scored",
+            )?,
+            alerts: IntCounter::new(
+                "detektive_score_alerts_total",
+                "Payments whose score reached the alert threshold",
+            )?,
+            alerts_published: IntCounter::new(
+                "detektive_score_alerts_published_total",
+                "Alerts written to the alerts topic",
+            )?,
+            score: Histogram::with_opts(
+                HistogramOpts::new(
+                    "detektive_score",
+                    "The model's score (probability of laundering), per payment",
+                )
+                .buckets(vec![
+                    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 0.9,
+                    1.0,
+                ]),
+            )?,
+            score_time: Histogram::with_opts(
+                HistogramOpts::new(
+                    "detektive_score_seconds",
+                    "Time the model alone takes to score one payment",
+                )
+                .buckets(vec![
+                    1e-6, 2.5e-6, 5e-6, 1e-5, 1.5e-5, 2e-5, 3e-5, 5e-5, 1e-4, 2.5e-4, 1e-3,
+                ]),
+            )?,
+            threshold: Gauge::new(
+                "detektive_score_threshold",
+                "The loaded model's alert threshold",
+            )?,
             registry,
         };
         m.registry.register(Box::new(m.messages.clone()))?;
@@ -229,6 +273,12 @@ impl Metrics {
         m.registry.register(Box::new(m.scatter_gather.clone()))?;
         m.registry
             .register(Box::new(m.scatter_gather_truncated.clone()))?;
+        m.registry.register(Box::new(m.scored.clone()))?;
+        m.registry.register(Box::new(m.alerts.clone()))?;
+        m.registry.register(Box::new(m.alerts_published.clone()))?;
+        m.registry.register(Box::new(m.score.clone()))?;
+        m.registry.register(Box::new(m.score_time.clone()))?;
+        m.registry.register(Box::new(m.threshold.clone()))?;
         // make every outcome visible from the start, at 0
         for outcome in ["processed", "duplicate", "bad"] {
             m.messages.with_label_values(&[outcome]);

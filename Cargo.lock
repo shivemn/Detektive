@@ -390,6 +390,7 @@ dependencies = [
  "clap",
  "detektive-graph",
  "detektive-replay",
+ "detektive-score",
  "prometheus",
  "rdkafka",
  "serde",
