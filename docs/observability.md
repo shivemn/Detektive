@@ -43,7 +43,7 @@ questions:
 
 | Metric | Measures | Answers |
 | --- | --- | --- |
-| `detektive_consumer_handle_seconds` | CPU time to decode and count one message | Is the code fast? |
+| `detektive_consumer_handle_seconds` | CPU time to handle one message: decode it, add it to the graph and, with a model, score it | Is the code fast? |
 | `detektive_consumer_end_to_end_latency_seconds` | Wall-clock time from the producer writing a message to the consumer handling it | Is the system keeping up? |
 | `detektive_consumer_event_lateness_seconds` | How far an event's own timestamp is behind the newest event already seen | How disordered is the data? |
 
@@ -106,6 +106,12 @@ time for lateness.
 | `detektive_graph_cycle_search_truncated_total` | counter | Cycle searches stopped at their budget (expected 0) |
 | `detektive_graph_scatter_gather_width` | histogram | Width of the widest scatter-gather each payment is part of |
 | `detektive_graph_scatter_gather_truncated_total` | counter | Scatter-gather searches stopped at their budget (expected 0) |
+| `detektive_score_payments_total` | counter | Payments the model scored (0 when no model is loaded) |
+| `detektive_score_alerts_total` | counter | Payments whose score reached the threshold |
+| `detektive_score_alerts_published_total` | counter | Alerts the broker confirmed on the `alerts` topic |
+| `detektive_score` | histogram | The model's score per payment |
+| `detektive_score_seconds` | histogram | Time the model alone takes per payment |
+| `detektive_score_threshold` | gauge | The loaded model's alert threshold |
 
 What the graph metrics mean: [graph-engine.md](graph-engine.md).
 

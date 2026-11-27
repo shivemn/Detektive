@@ -5,7 +5,10 @@ it, the way a bank's payment feed would arrive.
 
 ```
 replayer --(payments topic, 3 partitions)--> consumer --(bad messages)--> payments-dead-letter
+                                                      \--(alerts, from week 11)--> alerts
 ```
+
+Alerts and scoring are described in [scoring.md](scoring.md).
 
 ## Running it
 
@@ -33,6 +36,7 @@ The stream is **at-least-once**, and the consumer turns that into
 | Producer | Key = sender account | One sender's payments stay on one partition, in order |
 | Consumer | Store an offset only after handling its message; librdkafka commits stored offsets every second | A crash repeats a few messages but never skips one |
 | Consumer | Undecodable message → dead-letter topic, with the reason and source offset in headers, confirmed before its offset is stored | One bad message never stops the stream and is never silently lost |
+| Consumer | An alert is confirmed on the `alerts` topic before its payment's offset is stored | An alert can be written twice after a crash, never lost; readers key on `tx_id` |
 | Consumer | Skip any `tx_id` already seen (a 0.6 MB bitset for 5M ids) | Repeats from at-least-once delivery are not counted twice |
 | Consumer | Leave the group on shutdown; 6 s session timeout | Partitions move to another member at once on a clean stop, within 6 s on a crash |
 

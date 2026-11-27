@@ -137,6 +137,12 @@ The run fits in about 6 GB:
 An earlier attempt that copied each split separately was killed for running
 out of memory on the 7 GB cloud VM.
 
+## What came next
+
+Week 11 exports the seed-0 LightGBM model to ONNX and scores it in the stream,
+from Rust. It also scores alerts at daily review budgets and looks at why test
+scores fall below validation: [scoring.md](scoring.md).
+
 ## Tests
 
 `ml/tests/test_graph_boost.py` checks the following:

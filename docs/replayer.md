@@ -32,6 +32,11 @@ bank, so `"03208:8000F4580"` is the key. Each key gets a dense `u32` id in
 order of first appearance. The graph engine needs exactly this: array
 indexes instead of string hashing on every edge.
 
+**Banks travel with the payment.** Each event also carries the sender's and
+receiver's bank as small ids (`src_bank`, `dst_bank`, week 11), because the
+model uses whether a payment stays inside one bank. In India that would be the
+IFSC prefix, which every payment message carries anyway.
+
 **Labels stay off the stream.** A real payment stream carries no answer key.
 If the engine could see `is_laundering`, a bug could quietly let it cheat.
 Evaluation joins labels back on by `tx_id` instead. `--with-labels` exists
