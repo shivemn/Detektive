@@ -1,0 +1,63 @@
+{
+  "model": "lightgbm",
+  "note": "test fixture trained on synthetic data",
+  "trees": 60,
+  "features": [
+    "log_amount_paid",
+    "log_amount_received",
+    "amount_ratio",
+    "cross_currency",
+    "same_bank",
+    "self_transfer",
+    "hour",
+    "weekday",
+    "payment_format",
+    "payment_currency",
+    "receiving_currency",
+    "src_out_degree",
+    "src_fan_out",
+    "src_in_degree",
+    "src_fan_in",
+    "dst_in_degree",
+    "dst_fan_in",
+    "dst_out_degree",
+    "dst_fan_out",
+    "pair_count",
+    "cycles",
+    "shortest_cycle",
+    "src_cycles",
+    "dst_cycles",
+    "ring_repeats",
+    "ring_one_format",
+    "ring_amount_ratio",
+    "scatter_gather",
+    "src_gather_scatter",
+    "dst_gather_scatter"
+  ],
+  "categories": {
+    "payment_format": {
+      "ACH": 0,
+      "Bitcoin": 1,
+      "Cash": 2,
+      "Cheque": 3,
+      "Credit Card": 4,
+      "Reinvestment": 5,
+      "Wire": 6
+    },
+    "payment_currency": {
+      "Euro": 0,
+      "Rupee": 1,
+      "UK Pound": 2,
+      "US Dollar": 3,
+      "Yuan": 4
+    },
+    "receiving_currency": {
+      "Euro": 0,
+      "Rupee": 1,
+      "UK Pound": 2,
+      "US Dollar": 3,
+      "Yuan": 4
+    }
+  },
+  "threshold": 0.6214943025401709
+}

@@ -4,6 +4,7 @@ data/processed/
 *.parquet
 *.csv
 !ml/tests/fixtures/*.csv
+!crates/score/tests/fixtures/*.csv
 
 # experiment output
 results/*.json
