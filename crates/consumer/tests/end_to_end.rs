@@ -399,7 +399,7 @@ async fn alerts_reach_the_alerts_topic_and_match_lightgbm() {
         .lines()
         .skip(1)
         .map(|l| {
-            let (id, score) = l.split_once(',').unwrap();
+            let (id, score) = l.trim_end().split_once(',').unwrap();
             (id.parse().unwrap(), score.parse().unwrap())
         })
         .collect();

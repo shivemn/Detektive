@@ -17,7 +17,7 @@ fn lightgbm_scores() -> HashMap<u32, f64> {
     text.lines()
         .skip(1)
         .map(|line| {
-            let (id, score) = line.split_once(',').unwrap();
+            let (id, score) = line.trim_end().split_once(',').unwrap();
             (id.parse().unwrap(), score.parse().unwrap())
         })
         .collect()
