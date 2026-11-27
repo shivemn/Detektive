@@ -83,28 +83,40 @@ fn main() -> Result<()> {
         format: t.format as u8,
     };
 
+    // nanoseconds per payment: the model alone, and (one by one only) the
+    // graph and the model together, as the consumer does it
     let mut timings: Vec<u32> = Vec::with_capacity(take);
+    let mut whole: Vec<u32> = Vec::with_capacity(if args.batch == 0 { take } else { 0 });
+    let nanos = |d: std::time::Duration| d.as_nanos().min(u128::from(u32::MAX)) as u32;
     let mut alerts = 0u64;
     let started = Instant::now();
     for group in rows.chunks(args.batch.max(1)) {
+        let mut graph_took = Vec::new();
         let observed: Vec<Option<Observation>> = if args.batch == 0 {
             group
                 .iter()
                 .map(|t| {
+                    let clock = Instant::now();
                     engine.advance(t.ts);
-                    engine.add(payment(t))
+                    let obs = engine.add(payment(t));
+                    graph_took.push(clock.elapsed());
+                    obs
                 })
                 .collect()
         } else {
             let batch: Vec<(i64, Payment)> = group.iter().map(|t| (t.ts, payment(t))).collect();
             engine.add_batch(&batch)
         };
-        for (t, obs) in group.iter().zip(observed) {
+        for (k, (t, obs)) in group.iter().zip(observed).enumerate() {
             // in time order nothing is ever too late
             let Some(obs) = obs else { continue };
             let clock = Instant::now();
             let score = model.score(&Row::from(t), &obs.features);
-            timings.push(clock.elapsed().as_nanos().min(u128::from(u32::MAX)) as u32);
+            let took = clock.elapsed();
+            timings.push(nanos(took));
+            if let Some(g) = graph_took.get(k) {
+                whole.push(nanos(*g + took));
+            }
             if score >= model.threshold() {
                 alerts += 1;
             }
@@ -118,21 +130,15 @@ fn main() -> Result<()> {
     }
     let elapsed = started.elapsed().as_secs_f64();
 
-    timings.sort_unstable();
-    let pct = |p: f64| f64::from(timings[((timings.len() - 1) as f64 * p) as usize]) / 1000.0;
-    let mean = timings.iter().map(|&t| f64::from(t)).sum::<f64>() / timings.len() as f64 / 1000.0;
     eprintln!(
         "{} payments scored in {elapsed:.1}s, graph included ({:.0}/s)",
         timings.len(),
         timings.len() as f64 / elapsed
     );
-    eprintln!(
-        "model alone, per payment: mean {mean:.1} µs, p50 {:.1}, p99 {:.1}, p99.9 {:.1}, max {:.1}",
-        pct(0.5),
-        pct(0.99),
-        pct(0.999),
-        pct(1.0)
-    );
+    report("model alone", &mut timings);
+    if !whole.is_empty() {
+        report("graph and model", &mut whole);
+    }
     eprintln!(
         "{alerts} alerts at the threshold ({:.3}% of payments)",
         alerts as f64 * 100.0 / timings.len() as f64
@@ -141,4 +147,21 @@ fn main() -> Result<()> {
         eprintln!("scores written to {}", path.display());
     }
     Ok(())
+}
+
+/// Percentiles of per-payment times given in nanoseconds, printed in µs.
+fn report(what: &str, nanos: &mut [u32]) {
+    if nanos.is_empty() {
+        return;
+    }
+    nanos.sort_unstable();
+    let pct = |p: f64| f64::from(nanos[((nanos.len() - 1) as f64 * p) as usize]) / 1000.0;
+    let mean = nanos.iter().map(|&t| f64::from(t)).sum::<f64>() / nanos.len() as f64 / 1000.0;
+    eprintln!(
+        "{what}, per payment: mean {mean:.1} µs, p50 {:.1}, p99 {:.1}, p99.9 {:.1}, max {:.1}",
+        pct(0.5),
+        pct(0.99),
+        pct(0.999),
+        pct(1.0)
+    );
 }
