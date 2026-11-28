@@ -49,6 +49,8 @@ class Matrix:
     info: dict
     # the integer code of each category value, learned on training rows
     categories: dict[str, dict[str, int]]
+    # tx_id of each row of X
+    tx_ids: np.ndarray | None = None
 
 
 def join_graph(df: pl.DataFrame, graph_csv: Path) -> tuple[pl.DataFrame, list[str]]:
@@ -62,12 +64,30 @@ def join_graph(df: pl.DataFrame, graph_csv: Path) -> tuple[pl.DataFrame, list[st
     return joined, names
 
 
-def build(df: pl.DataFrame, graph_names: list[str], which: str) -> Matrix:
-    """One float32 matrix for all rows, sorted by time, plus where each split starts."""
+def build(
+    df: pl.DataFrame,
+    graph_names: list[str],
+    which: str,
+    drop: tuple[str, ...] = (),
+    only_format: str | None = None,
+) -> Matrix:
+    """One float32 matrix for all rows, sorted by time, plus where each split starts.
+
+    `drop` leaves the named feature columns out. `only_format` keeps only the
+    payments of one payment format (and so leaves the format column out). The
+    split boundaries and the sparse tail stay those of the whole file, so the
+    periods are the same calendar days with or without the filter.
+    """
     if which not in FEATURE_SETS:
         raise ValueError(f"feature set must be one of {FEATURE_SETS}")
     df = df.sort(["timestamp", "tx_id"])
     split = time_split(df.select("timestamp", "is_laundering"))
+    tail_start = sparse_tail_start(df.select("timestamp"))
+    if only_format is not None:
+        df = df.filter(pl.col("payment_format") == only_format)
+        if df.is_empty():
+            raise ValueError(f"no payments with format {only_format!r}")
+        drop = (*drop, "payment_format")
     ts = df["timestamp"].to_numpy()
     a = int(np.searchsorted(ts, np.datetime64(split.val_start), "left"))
     b = int(np.searchsorted(ts, np.datetime64(split.test_start), "left"))
@@ -86,18 +106,31 @@ def build(df: pl.DataFrame, graph_names: list[str], which: str) -> Matrix:
         columns += rows.get_columns()
     if which in ("graph", "both"):
         columns += df.select(graph_names).get_columns()
+    present = {c.name for c in columns}
+    unknown = [d for d in drop if d not in present and not (d == "payment_format" and only_format)]
+    if unknown:
+        raise ValueError(f"cannot drop {unknown}: not among the features")
+    columns = [c for c in columns if c.name not in drop]
+    categories = {k: v for k, v in categories.items() if k not in drop}
 
     X = np.empty((n, len(columns)), dtype=np.float32)
     for j, col in enumerate(columns):
         X[:, j] = col.cast(pl.Float32).to_numpy()
     names = [c.name for c in columns]
 
-    tail_start = sparse_tail_start(df.select("timestamp"))
     tail = ts[b:] >= np.datetime64(tail_start) if tail_start else None
     info = split.summary()
     info["sparse_tail_start"] = str(tail_start) if tail_start else None
+    if drop:
+        info["dropped"] = list(drop)
+    if only_format is not None:
+        info["only_format"] = only_format
+        y_all = df["is_laundering"].to_numpy()
+        for part, s in (("train", slice(0, a)), ("val", slice(a, b)), ("test", slice(b, n))):
+            info[part] = {**info.get(part, {}), "rows": s.stop - s.start, "positives": int(y_all[s].sum())}
     y = df["is_laundering"].to_numpy().astype(np.int8)
-    return Matrix(X, y, names, slice(0, a), slice(a, b), slice(b, n), tail, info, categories)
+    return Matrix(X, y, names, slice(0, a), slice(a, b), slice(b, n), tail, info, categories,
+                  df["tx_id"].to_numpy())
 
 
 def fit_xgb(m: Matrix, seed: int, weight: float):
@@ -166,8 +199,10 @@ def fit_lgbm(m: Matrix, seed: int, weight: float):
 
 
 def run(
-    m: Matrix, model: str, seeds: tuple[int, ...], class_weight: bool = False
+    m: Matrix, model: str, seeds: tuple[int, ...], class_weight: bool = False, scores: Path | None = None
 ) -> tuple[dict[int, Scores], dict[int, Scores], dict]:
+    """Train and score one model per seed. With `scores`, the first seed's
+    score for every row is written there (tx_id,score)."""
     fit = {"xgb": fit_xgb, "lgbm": fit_lgbm}[model]
     y_train, y_val, y_test = m.y[m.train], m.y[m.val], m.y[m.test]
     pos = max(int(y_train.sum()), 1)
@@ -189,6 +224,14 @@ def run(
         print(f"{line}, trees {trees}, {time.perf_counter() - started:.0f}s", flush=True)
         for k, v in gain.items():
             gains[k] = gains.get(k, 0.0) + v / len(seeds)
+        if scores is not None and seed == seeds[0]:
+            if m.tx_ids is None:
+                raise ValueError("this matrix does not know its tx_ids, so its scores cannot be written")
+            scores.parent.mkdir(parents=True, exist_ok=True)
+            everything = slice(0, len(m.y))
+            order = np.argsort(m.tx_ids, kind="stable")
+            pl.DataFrame({"tx_id": m.tx_ids[order], "score": predict(everything)[order]}).write_csv(scores)
+            print(f"  scores of seed {seed} written to {scores}", flush=True)
     return runs, trimmed_runs, gains
 
 
@@ -200,6 +243,11 @@ def main() -> None:
     parser.add_argument("--models", nargs="+", choices=MODELS, default=list(MODELS))
     parser.add_argument("--seeds", type=int, nargs="+", default=list(DEFAULT_SEEDS))
     parser.add_argument("--class-weight", action="store_true", help="weight positives by the class ratio")
+    parser.add_argument("--drop", nargs="+", default=[], metavar="FEATURE", help="leave these features out")
+    parser.add_argument("--only-format", metavar="FORMAT",
+                        help="train and test on payments of this format only (e.g. ACH)")
+    parser.add_argument("--scores", action="store_true",
+                        help="write the first seed's score for every payment next to the results")
     parser.add_argument("--out", type=Path, default=Path("results"))
     args = parser.parse_args()
 
@@ -208,14 +256,17 @@ def main() -> None:
                    "payment_currency", "receiving_currency", "payment_format",
                    "from_bank", "to_bank", "src", "dst", *graph_names)
     for which in args.features:
-        m = build(df, graph_names, which)
+        m = build(df, graph_names, which, tuple(args.drop), args.only_format)
         print(f"features: {which} ({len(m.names)} columns) | train {m.train.stop:,} | "
               f"val {m.val.stop - m.val.start:,} | test {m.test.stop - m.test.start:,}", flush=True)
         for model in args.models:
             print(f"{model}:", flush=True)
-            runs, trimmed, gains = run(m, model, tuple(args.seeds), args.class_weight)
-            top = sorted(gains.items(), key=lambda kv: -kv[1])
             name = f"{model}_{which}" + ("_weighted" if args.class_weight else "")
+            name += "".join(f"_no-{d}" for d in args.drop)
+            name += f"_only-{args.only_format}" if args.only_format else ""
+            scores = args.out / f"scores__{name}__{args.data.stem}.csv" if args.scores else None
+            runs, trimmed, gains = run(m, model, tuple(args.seeds), args.class_weight, scores)
+            top = sorted(gains.items(), key=lambda kv: -kv[1])
             path = save(
                 name, args.data.stem, runs, m.info, args.out,
                 runs_without_tail=trimmed or None,

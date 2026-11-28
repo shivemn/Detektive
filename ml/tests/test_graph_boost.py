@@ -87,3 +87,44 @@ def test_models_learn_the_planted_signal(sample, model):
     assert summarise(list(runs.values()))["f1"]["mean"] > 50
     assert max(gains, key=gains.get) == "cycles"
     json.dumps(gains)  # saved with the results, so it must serialise
+
+
+def test_dropping_features_leaves_them_out(sample):
+    df, path = sample
+    joined, names = join_graph(df, path)
+    full = build(joined, names, "both")
+    less = build(joined, names, "both", drop=("payment_format", "cycles"))
+    assert "payment_format" not in less.names and "cycles" not in less.names
+    assert less.names == [n for n in full.names if n not in ("payment_format", "cycles")]
+    assert "payment_format" not in less.categories
+    assert np.array_equal(less.X[:, less.names.index("hour")], full.X[:, full.names.index("hour")])
+    with pytest.raises(ValueError, match="cannot drop"):
+        build(joined, names, "both", drop=("no_such_feature",))
+
+
+def test_one_format_keeps_the_calendar_split(sample):
+    df, path = sample
+    joined, names = join_graph(df, path)
+    full = build(joined, names, "both")
+    fmt = joined["payment_format"].mode()[0]
+    one = build(joined, names, "both", only_format=fmt)
+    assert "payment_format" not in one.names
+    kept = joined.filter(pl.col("payment_format") == fmt).height
+    assert len(one.y) == kept < len(full.y)
+    # same calendar boundaries as the whole file
+    assert one.info["val_start"] == full.info["val_start"]
+    assert one.info["test_start"] == full.info["test_start"]
+    assert one.info["test"]["rows"] == one.test.stop - one.test.start
+    assert set(one.tx_ids) <= set(full.tx_ids)
+
+
+def test_scores_are_written_for_every_row(sample, tmp_path):
+    df, path = sample
+    joined, names = join_graph(df, path)
+    m = build(joined, names, "graph")
+    out = tmp_path / "scores.csv"
+    run(m, "lgbm", seeds=(0,), scores=out)
+    written = pl.read_csv(out)
+    assert written.height == len(m.y)
+    assert written["tx_id"].is_sorted() and written["tx_id"].n_unique() == written.height
+    assert written["score"].is_between(0, 1).all()
