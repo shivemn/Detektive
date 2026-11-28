@@ -13,8 +13,11 @@
 pub mod forest;
 pub mod model;
 pub mod onnx;
+pub mod reasons;
 pub mod row;
+pub mod shap;
 
 pub use forest::Forest;
-pub use model::{Card, Model, WIDTH};
+pub use model::{Card, Explanation, Model, Reason, WIDTH, feature_names};
 pub use row::Row;
+pub use shap::{Contribution, Shap};

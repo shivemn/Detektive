@@ -8,7 +8,11 @@ Writes into crates/score/tests/fixtures/:
 - model.onnx and model.json: a LightGBM model trained on it through the same
   feature pipeline as the real model, kept small (60 trees) so the files stay
   small;
-- scores.csv: LightGBM's own score for every payment.
+- scores.csv: LightGBM's own score for every payment;
+- cover.json: training rows through each tree node, for explanations;
+- contributions.csv: LightGBM's own explanation (pred_contrib) of every
+  tenth payment: each feature's share of the raw score, then the expected
+  value.
 
 The Rust test reads sample.csv, computes the features and scores itself, and
 must land on scores.csv. Rerun this only when the features or the export
@@ -26,7 +30,7 @@ import polars as pl
 
 from detektive_ml.data import read_raw_csv
 from detektive_ml.evaluate import best_threshold
-from detektive_ml.models.export import compare, onnx_scores, round_thresholds_down, to_onnx
+from detektive_ml.models.export import compare, onnx_scores, round_thresholds_down, to_onnx, write_cover
 from detektive_ml.models.graph_boost import build, join_graph
 from detektive_ml.synthetic import write_sample
 
@@ -60,12 +64,19 @@ def main() -> None:
     print("onnxruntime against LightGBM:", check)
 
     (OUT / "model.onnx").write_bytes(model.SerializeToString())
+    write_cover(model, booster, OUT)
     card = {"model": "lightgbm", "note": "test fixture trained on synthetic data",
             "trees": booster.num_trees(), "features": m.names, "categories": m.categories,
             "threshold": threshold}
     (OUT / "model.json").write_text(json.dumps(card, indent=2) + "\n")
     order = np.argsort(tx_ids, kind="stable")
     pl.DataFrame({"tx_id": tx_ids[order], "score": scores[order]}).write_csv(OUT / "scores.csv")
+    every_tenth = order[::10]
+    contrib = booster.predict(m.X[every_tenth], pred_contrib=True)
+    columns = {"tx_id": tx_ids[every_tenth]}
+    columns.update({name: contrib[:, j] for j, name in enumerate(m.names)})
+    columns["expected"] = contrib[:, -1]
+    pl.DataFrame(columns).write_csv(OUT / "contributions.csv")
     print(f"wrote {OUT}")
 
 

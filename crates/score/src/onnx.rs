@@ -115,12 +115,32 @@ impl TensorProto {
     }
 }
 
-pub fn read(path: &Path) -> Result<Forest> {
+/// The trees as the file has them, one entry per ONNX node, in file order.
+#[derive(Debug, Clone)]
+pub struct Trees {
+    pub nodes: Vec<Node>,
+    /// Each tree's root, as an index into `nodes`, in tree order.
+    pub roots: Vec<u32>,
+    pub base: f64,
+    pub post: PostTransform,
+}
+
+impl Trees {
+    pub fn forest(&self) -> Result<Forest> {
+        Forest::new(self.nodes.clone(), self.roots.clone(), self.base, self.post)
+    }
+}
+
+pub fn read(path: &Path) -> Result<Trees> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    decode(&bytes).with_context(|| format!("reading the trees in {}", path.display()))
+    decode_trees(&bytes).with_context(|| format!("reading the trees in {}", path.display()))
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Forest> {
+    decode_trees(bytes)?.forest()
+}
+
+pub fn decode_trees(bytes: &[u8]) -> Result<Trees> {
     let model = ModelProto::decode(bytes).context("not an ONNX model")?;
     let graph = model.graph.ok_or_else(|| anyhow!("model has no graph"))?;
     let mut ensembles = graph
@@ -135,7 +155,7 @@ pub fn decode(bytes: &[u8]) -> Result<Forest> {
         "more than one tree ensemble in the model"
     );
     check_wrapping(&graph)?;
-    Attributes::of(node).forest()
+    Attributes::of(node).trees()
 }
 
 /// onnxmltools wraps the ensemble in a few bookkeeping nodes: Identity, a Cast
@@ -216,7 +236,7 @@ impl<'a> Attributes<'a> {
             .map(|a| String::from_utf8_lossy(&a.s).into_owned())
     }
 
-    fn forest(&self) -> Result<Forest> {
+    fn trees(&self) -> Result<Trees> {
         let tree_ids = self.ints("nodes_treeids")?;
         let node_ids = self.ints("nodes_nodeids")?;
         let feature_ids = self.ints("nodes_featureids")?;
@@ -335,11 +355,13 @@ impl<'a> Attributes<'a> {
             Err(_) => 0.0,
         };
 
-        Forest::new(
+        let trees = Trees {
             nodes,
-            roots.into_iter().map(|(_, i)| i).collect(),
+            roots: roots.into_iter().map(|(_, i)| i).collect(),
             base,
             post,
-        )
+        };
+        trees.forest()?; // checks the trees are trees
+        Ok(trees)
     }
 }

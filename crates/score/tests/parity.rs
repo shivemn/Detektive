@@ -99,3 +99,81 @@ fn tempdir() -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+#[test]
+fn explanations_match_lightgbm_pred_contrib() {
+    // every tenth payment, as LightGBM explained it: each feature's share of
+    // the raw score, then the expected value
+    let text = std::fs::read_to_string(fixtures().join("contributions.csv")).unwrap();
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap().trim_end().split(',').collect();
+    let expected: HashMap<u32, Vec<f64>> = lines
+        .map(|l| {
+            let mut cells = l.trim_end().split(',');
+            let id = cells.next().unwrap().parse().unwrap();
+            (id, cells.map(|c| c.parse().unwrap()).collect())
+        })
+        .collect();
+    let model = Model::load(&fixtures()).unwrap();
+    assert!(model.explains());
+    let names: Vec<&str> = detektive_score::feature_names().collect();
+    assert_eq!(&header[1..header.len() - 1], names.as_slice());
+
+    let data = load::load_csv(&fixtures().join("sample.csv")).unwrap();
+    let mut engine = Engine::new(EngineConfig::default());
+    let mut checked = 0;
+    let mut worst = 0f64;
+    for t in &data.transactions {
+        engine.advance(t.ts);
+        let obs = engine
+            .add(Payment {
+                tx: t.tx_id,
+                ts: t.ts,
+                src: t.src,
+                dst: t.dst,
+                amount: detektive_replay::india::to_inr(t.amount_paid, t.paid_currency),
+                format: t.format as u8,
+            })
+            .unwrap();
+        let Some(lgbm) = expected.get(&t.tx_id) else {
+            continue;
+        };
+        let row = Row::from(t);
+        let ours = model.contributions(&row, &obs.features).unwrap();
+        for (a, b) in ours.iter().zip(lgbm) {
+            worst = worst.max((a - b).abs());
+        }
+        let base = model.expected_log_odds().unwrap();
+        worst = worst.max((base - lgbm[lgbm.len() - 1]).abs());
+
+        // the reasons are the same numbers, largest first, in words
+        let e = model.explain(&row, &obs.features, 3, "4 days").unwrap();
+        assert_eq!(e.reasons.len(), 3);
+        assert!(
+            e.reasons
+                .windows(2)
+                .all(|w| w[0].log_odds.abs() >= w[1].log_odds.abs())
+        );
+        let raw = model.score(&row, &obs.features);
+        assert!(
+            (1.0 / (1.0 + (-e.log_odds).exp()) - raw).abs() < 1e-12,
+            "shares add up to the score"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, expected.len());
+    // the f32 leaf values in the ONNX file again
+    assert!(worst < 1e-6, "largest difference from LightGBM: {worst:e}");
+}
+
+#[test]
+fn a_model_without_cover_scores_but_does_not_explain() {
+    let dir = tempdir().join("no-cover");
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in ["model.onnx", "model.json"] {
+        std::fs::copy(fixtures().join(f), dir.join(f)).unwrap();
+    }
+    let model = Model::load(&dir).unwrap();
+    assert!(!model.explains());
+    assert!(model.expected_log_odds().is_none());
+}
