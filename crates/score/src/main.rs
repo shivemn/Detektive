@@ -9,7 +9,7 @@ use clap::Parser;
 use detektive_graph::{Engine, EngineConfig, Observation, Payment};
 use detektive_replay::load;
 use detektive_replay::model::Transaction;
-use detektive_score::{Model, Row};
+use detektive_score::{Model, Row, WIDTH};
 
 /// Run an IBM AML transactions file through the graph engine and the model,
 /// in time order, and report how many payments would alert and how long
@@ -93,6 +93,11 @@ fn main() -> Result<()> {
         None => None,
     };
     let mut explain_timings: Vec<u32> = Vec::new();
+    let names: Vec<&str> = detektive_score::feature_names().collect();
+    let window_words = match args.window_hours {
+        h if h % 24.0 == 0.0 => format!("{} days", h / 24.0),
+        h => format!("{h} hours"),
+    };
     let mut seen = 0usize;
 
     let mut engine = Engine::new(EngineConfig {
@@ -156,16 +161,25 @@ fn main() -> Result<()> {
                 && (alert || sampled)
             {
                 let clock = Instant::now();
-                let phi = model
-                    .contributions(&row, &obs.features)
+                let e = model
+                    .explain(&row, &obs.features, WIDTH, &window_words)
                     .expect("checked above");
                 explain_timings.push(nanos(clock.elapsed()));
+                // every feature's share in feature order, then the top five in words
+                let mut phi = vec![0.0; WIDTH];
+                for r in &e.reasons {
+                    phi[names
+                        .iter()
+                        .position(|n| *n == r.feature)
+                        .expect("known feature")] = r.log_odds;
+                }
                 let line = serde_json::json!({
                     "tx_id": t.tx_id,
                     "score": score,
                     "alert": alert,
-                    "expected": model.expected_log_odds(),
+                    "expected": e.expected_log_odds,
                     "contributions": phi,
+                    "reasons": &e.reasons[..5],
                 });
                 writeln!(w, "{line}")?;
             }
