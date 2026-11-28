@@ -10,7 +10,7 @@ arrives. Every alert says which pattern it matched and why.
 The engine will be written in Rust. Models are trained in Python and served
 from Rust through ONNX.
 
-> **Status: week 11 of about 24.** What exists today is the data pipeline, the
+> **Status: week 12 of about 24.** What exists today is the data pipeline, the
 > evaluation protocol, a floor baseline, a Rust replayer that streams the data
 > in time order, a consumer service reading that stream from Redpanda,
 > Prometheus metrics with a Grafana dashboard, and the graph engine's features
@@ -18,8 +18,7 @@ from Rust through ONNX.
 > features, temporal cycles and their shape, scatter-gather and gather-scatter
 > for every payment). On top of those sit a boosted-tree model trained on the
 > features and exported to ONNX, and a Rust scorer that runs it on every
-> payment in the stream and publishes alerts. Alerts do not yet explain
-> themselves.
+> payment in the stream and publishes alerts. Each alert says why it fired.
 
 ## Data
 
@@ -139,6 +138,30 @@ catches almost none of it. That caps recall at about 60% for features like
 these. Details, timings and the validation-to-test gap:
 [docs/scoring.md](docs/scoring.md).
 
+## Why an alert fired
+
+Each alert carries the five features that moved its score most, in words, and
+how far each one pushed it:
+
+```
+  +4.58  paid by ACH
+  +2.35  the sender's first payment to this receiver in the last 4 days
+  +1.48  the sender's money reached the receiver through 13 different middle accounts
+```
+
+These come from TreeSHAP, computed in Rust. On 23,408 HI-Small payments they
+match LightGBM's own `pred_contrib` to within 2 × 10⁻⁷, with the same top
+reason on every one. Explaining takes about 5 ms a payment, so only alerts are
+explained.
+
+Summed over the test alerts, the explanations show what the model really
+learned. ACH is the largest reason for every alert, and a first payment to a
+new payee is usually the second; on HI-Small, ACH carries 48 times the
+laundering rate of the other methods. The rings and scatter-gathers are among
+the top five reasons for only 1 alert in 5, but those alerts are laundering
+86% of the time, against 64% for the rest. What that means for the
+project: [docs/explanations.md](docs/explanations.md).
+
 ## Running it
 
 Python needs 3.10+; Rust needs a stable toolchain (`rustup`). The Redpanda
@@ -174,6 +197,7 @@ cd ml && python -m detektive_ml.models.graph_boost ../data/processed/hi_small.pa
 # the model the stream runs: export it, then score the whole file in Rust
 python -m detektive_ml.models.export ../data/processed/hi_small.parquet ../features.csv ../models --scores
 cd .. && cargo run --release -p detektive-score -- data/raw/HI-Small_Trans.csv --model models
+cargo run --release -p detektive-score -- data/raw/HI-Small_Trans.csv --model models --explain explain.jsonl
 DETEKTIVE_MODEL=/models docker compose up -d   # the consumer scores and alerts
 ```
 
