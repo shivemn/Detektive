@@ -111,6 +111,7 @@ time for lateness.
 | `detektive_score_alerts_published_total` | counter | Alerts the broker confirmed on the `alerts` topic |
 | `detektive_score` | histogram | The model's score per payment |
 | `detektive_score_seconds` | histogram | Time the model alone takes per payment |
+| `detektive_score_explain_seconds` | histogram | Time to work out the reasons behind one alert |
 | `detektive_score_threshold` | gauge | The loaded model's alert threshold |
 
 What the graph metrics mean: [graph-engine.md](graph-engine.md).
