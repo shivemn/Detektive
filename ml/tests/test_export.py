@@ -35,8 +35,11 @@ def test_round_thresholds_is_idempotent():
 
 def test_compare_counts_flips():
     a = np.array([0.1, 0.5, 0.9])
-    assert compare(a, a, 0.5) == {"rows": 3, "max_abs_diff": 0.0, "alert_flips": 0}
-    assert compare(a, a - [0, 0.01, 0], 0.5)["alert_flips"] == 1
+    assert compare(a, a, 0.5) == {"rows": 3, "max_abs_diff": 0.0, "alert_flips": 0, "on_the_threshold": 1}
+    # the payment sitting on the threshold may fall either side
+    assert compare(a, a - [0, 1e-7, 0], 0.5)["alert_flips"] == 0
+    # one clear of it may not
+    assert compare(a, a - [0, 0, 0.5], 0.5)["alert_flips"] == 1
 
 
 def test_check_scores_joins_by_tx_id_and_spares_the_threshold():

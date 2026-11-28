@@ -113,10 +113,15 @@ def onnx_scores(model, X: np.ndarray, batch: int = 200_000) -> np.ndarray:
     return np.concatenate(out)
 
 
-def compare(reference: np.ndarray, exported: np.ndarray, threshold: float) -> dict:
+def compare(reference: np.ndarray, exported: np.ndarray, threshold: float, margin: float = 1e-6) -> dict:
+    """Largest score difference, and alert decisions that differ. The threshold
+    is itself one validation payment's score, so a payment within `margin` of
+    it may land either side; it is counted apart, not as a flip."""
     diff = np.abs(reference.astype(np.float64) - exported.astype(np.float64))
-    flips = int(np.sum((reference >= threshold) != (exported >= threshold)))
-    return {"rows": len(reference), "max_abs_diff": float(diff.max()), "alert_flips": flips}
+    near = np.abs(reference - threshold) <= margin
+    flipped = (reference >= threshold) != (exported >= threshold)
+    return {"rows": len(reference), "max_abs_diff": float(diff.max()),
+            "alert_flips": int(np.sum(flipped & ~near)), "on_the_threshold": int(np.sum(near))}
 
 
 def main() -> None:
