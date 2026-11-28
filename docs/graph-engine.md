@@ -478,7 +478,7 @@ works.
 - **A ring is flagged when it closes, not before.** Its earlier payments were
   already scored by then. `src_cycles` and `dst_cycles` flag the accounts'
   later payments; raising an alert on the earlier ones after the fact is a
-  job for the alert layer (week 12).
+  job for the alert layer, and still open.
 
 - **Online features see a slightly different window from offline ones.**
   Offline (the `detektive-graph` tool, and training in week 10) the stream is

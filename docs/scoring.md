@@ -237,8 +237,8 @@ payment was scored.
 
 An alert carries the payment, its score, the threshold and the graph facts
 behind it: pair count, fan-in and fan-out, cycles and the ring, ring repeats,
-and scatter-gather width. These are the features as computed, not an
-explanation of the score. Explaining which features drove a score is week 12.
+and scatter-gather width. From week 12 it also carries the five features that
+moved its score most, in words; see [explanations.md](explanations.md).
 
 ## Known gaps
 
