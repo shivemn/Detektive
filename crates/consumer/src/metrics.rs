@@ -71,6 +71,7 @@ pub struct Metrics {
     pub alerts_published: IntCounter,
     pub score: Histogram,
     pub score_time: Histogram,
+    pub explain_time: Histogram,
     pub threshold: Gauge,
 }
 
@@ -241,6 +242,15 @@ impl Metrics {
                     1e-6, 2.5e-6, 5e-6, 1e-5, 1.5e-5, 2e-5, 3e-5, 5e-5, 1e-4, 2.5e-4, 1e-3,
                 ]),
             )?,
+            explain_time: Histogram::with_opts(
+                HistogramOpts::new(
+                    "detektive_score_explain_seconds",
+                    "Time to work out the reasons behind one alert",
+                )
+                .buckets(vec![
+                    1e-4, 5e-4, 1e-3, 2e-3, 3e-3, 5e-3, 7.5e-3, 1e-2, 2.5e-2, 0.1,
+                ]),
+            )?,
             threshold: Gauge::new(
                 "detektive_score_threshold",
                 "The loaded model's alert threshold",
@@ -278,6 +288,7 @@ impl Metrics {
         m.registry.register(Box::new(m.alerts_published.clone()))?;
         m.registry.register(Box::new(m.score.clone()))?;
         m.registry.register(Box::new(m.score_time.clone()))?;
+        m.registry.register(Box::new(m.explain_time.clone()))?;
         m.registry.register(Box::new(m.threshold.clone()))?;
         // make every outcome visible from the start, at 0
         for outcome in ["processed", "duplicate", "bad"] {

@@ -437,6 +437,14 @@ async fn alerts_reach_the_alerts_topic_and_match_lightgbm() {
             let alert: serde_json::Value = serde_json::from_slice(m.payload().unwrap()).unwrap();
             assert!(alert["score"].as_f64().unwrap() >= threshold);
             assert_eq!(alert["payment"]["tx_id"], alert["tx_id"]);
+            // the test model explains itself: five reasons, in words
+            let reasons = alert["explanation"]["reasons"].as_array().unwrap();
+            assert_eq!(reasons.len(), 5);
+            assert!(
+                reasons
+                    .iter()
+                    .all(|r| r["text"].as_str().is_some_and(|t| !t.is_empty()))
+            );
             alerted.insert(alert["tx_id"].as_u64().unwrap() as u32);
             if alerted.len() as u64 == summary.alerts {
                 break;

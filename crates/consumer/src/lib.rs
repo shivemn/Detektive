@@ -210,15 +210,23 @@ pub async fn run(
                         if behind_partition > 0 {
                             metrics.behind_partition.with_label_values(&[&partition.to_string()]).inc();
                         }
-                        if let (Some(s), Some(o)) = (scored, &observation) {
+                        if let (Some(s), Some(o)) = (&scored, &observation) {
                             metrics.scored.inc();
                             metrics.score.observe(s.score);
                             metrics.score_time.observe(s.took.as_secs_f64());
                             if s.alert {
                                 metrics.alerts.inc();
+                                if let Some((_, took)) = s.explanation.as_deref() {
+                                    metrics.explain_time.observe(took.as_secs_f64());
+                                }
                                 let threshold = state.model.as_ref().map_or(1.0, Model::threshold);
                                 let alert = alert_json(&message, o, s, threshold);
-                                warn!(tx = o.tx, score = format!("{:.3}", s.score), threshold = format!("{threshold:.3}"), "alert");
+                                let because = s
+                                    .explanation
+                                    .as_deref()
+                                    .and_then(|(e, _)| e.reasons.first())
+                                    .map_or(String::new(), |r| r.text.clone());
+                                warn!(tx = o.tx, score = format!("{:.3}", s.score), threshold = format!("{threshold:.3}"), because, "alert");
                                 if let (Some(producer), Some(topic)) = (&producer, &cfg.alerts_topic) {
                                     publish_alert(producer, topic, o.tx, &alert).await?;
                                     metrics.alerts_published.inc();
@@ -342,10 +350,15 @@ fn end_to_end_latency(ts: Timestamp) -> Option<f64> {
     Some((now_ms - created_ms).max(0) as f64 / 1000.0)
 }
 
-/// What an alert says: the payment, its score, and the graph facts behind it.
-/// The facts are the features as computed, not an explanation of the score;
-/// explaining the model is a later step.
-fn alert_json(msg: &BorrowedMessage<'_>, o: &Observation, s: Scored, threshold: f64) -> String {
+/// What an alert says: the payment, its score, why the model scored it so
+/// (when the model can explain itself), and the graph facts around it.
+///
+/// Each reason is a feature, its value for this payment in words, and its
+/// share of the score in log-odds (positive pushed towards the alert). The
+/// expected log-odds plus every feature's share, not just the top few, is the
+/// payment's log-odds. The ring is the accounts of the shortest ring the
+/// payment closes, if any.
+fn alert_json(msg: &BorrowedMessage<'_>, o: &Observation, s: &Scored, threshold: f64) -> String {
     let f = &o.features;
     let payment: serde_json::Value = msg
         .payload()
@@ -356,6 +369,7 @@ fn alert_json(msg: &BorrowedMessage<'_>, o: &Observation, s: Scored, threshold: 
         "score": s.score,
         "threshold": threshold,
         "payment": payment,
+        "explanation": s.explanation.as_deref().map(|(e, _)| e),
         "graph": {
             "pair_count": f.pair_count,
             "sender_fan_out": f.src_fan_out,

@@ -20,11 +20,15 @@ use detektive_graph::{
 
 use detektive_replay::india;
 use detektive_replay::model::{Currency, PaymentFormat};
-use detektive_score::{Model, Row};
+use detektive_score::{Explanation, Model, Row};
 
 use crate::bitset::BitSet;
 use crate::event::{DecodeError, decode};
 
+// One Outcome exists per message, for as long as it takes to count it; none
+// are kept. Boxing the large variant would add an allocation per payment to
+// save memory that is never held.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
     Processed {
@@ -47,7 +51,7 @@ pub enum Outcome {
     Bad(DecodeError),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Scored {
     /// Probability of laundering, as the model sees it.
     pub score: f64,
@@ -55,6 +59,26 @@ pub struct Scored {
     pub alert: bool,
     /// Time spent in the model alone.
     pub took: Duration,
+    /// For an alert, when the model can explain itself: the reasons behind
+    /// the score, and the time it took to work them out.
+    pub explanation: Option<Box<(Explanation, Duration)>>,
+}
+
+/// How many reasons an alert carries.
+pub const REASONS: usize = 5;
+
+/// "4 days", "36 hours": the window as an alert's reasons describe it.
+pub fn describe_window(window: Duration) -> String {
+    let secs = window.as_secs();
+    match (secs / 86_400, secs % 86_400) {
+        (1, 0) => "day".to_owned(),
+        (d, 0) => format!("{d} days"),
+        _ if secs.is_multiple_of(3600) => match secs / 3600 {
+            1 => "hour".to_owned(),
+            h => format!("{h} hours"),
+        },
+        _ => format!("{} minutes", secs / 60),
+    }
 }
 
 /// How much event time the graph keeps, how far cycle searches go, and when
@@ -102,6 +126,7 @@ pub struct State {
     pub engine: Engine,
     pub model: Option<Model>,
     pub alerts: u64,
+    window_words: String,
 }
 
 impl Default for State {
@@ -131,6 +156,7 @@ impl State {
             }),
             model: None,
             alerts: 0,
+            window_words: describe_window(settings.window),
         }
     }
 
@@ -215,7 +241,20 @@ impl State {
                 let took = clock.elapsed();
                 let alert = score >= model.threshold();
                 self.alerts += u64::from(alert);
-                Some(Scored { score, alert, took })
+                let explanation = if alert {
+                    let clock = Instant::now();
+                    model
+                        .explain(&row, &obs.features, REASONS, &self.window_words)
+                        .map(|e| Box::new((e, clock.elapsed())))
+                } else {
+                    None
+                };
+                Some(Scored {
+                    score,
+                    alert,
+                    took,
+                    explanation,
+                })
             }
             _ => None,
         };
@@ -470,6 +509,16 @@ mod tests {
                 scored.alert,
                 scored.score >= s.model.as_ref().unwrap().threshold()
             );
+            // only alerts are explained, and then with the full set of reasons
+            match scored.explanation.as_deref() {
+                Some((e, _)) => {
+                    assert!(scored.alert);
+                    assert_eq!(e.reasons.len(), REASONS);
+                    let p = 1.0 / (1.0 + (-e.log_odds).exp());
+                    assert!((p - scored.score).abs() < 1e-9);
+                }
+                None => assert!(!scored.alert),
+            }
             scores.push(scored.score);
         }
         assert_eq!(
@@ -483,6 +532,15 @@ mod tests {
             scores.windows(2).any(|w| w[0] != w[1]),
             "the features should move the score"
         );
+    }
+
+    #[test]
+    fn windows_in_words() {
+        assert_eq!(describe_window(Duration::from_secs(4 * 86_400)), "4 days");
+        assert_eq!(describe_window(Duration::from_secs(86_400)), "day");
+        assert_eq!(describe_window(Duration::from_secs(36 * 3600)), "36 hours");
+        assert_eq!(describe_window(Duration::from_secs(3600)), "hour");
+        assert_eq!(describe_window(Duration::from_secs(90 * 60)), "90 minutes");
     }
 
     #[test]
