@@ -40,6 +40,16 @@ struct Args {
     /// Stop after this many transactions
     #[arg(long)]
     limit: Option<usize>,
+
+    /// Explain every alert, writing one JSON line per payment to this file
+    /// (needs cover.json next to the model)
+    #[arg(long)]
+    explain: Option<PathBuf>,
+
+    /// With --explain, also explain every Nth payment that does not alert,
+    /// so explanations can be checked away from the alerts too (0: none)
+    #[arg(long, default_value_t = 0)]
+    explain_every: usize,
 }
 
 fn main() -> Result<()> {
@@ -69,6 +79,21 @@ fn main() -> Result<()> {
         }
         None => None,
     };
+
+    let mut explained = match &args.explain {
+        Some(path) => {
+            anyhow::ensure!(
+                model.explains(),
+                "no cover.json next to the model, so it cannot explain scores"
+            );
+            let file =
+                File::create(path).with_context(|| format!("creating {}", path.display()))?;
+            Some(BufWriter::new(file))
+        }
+        None => None,
+    };
+    let mut explain_timings: Vec<u32> = Vec::new();
+    let mut seen = 0usize;
 
     let mut engine = Engine::new(EngineConfig {
         window: (args.window_hours * 3600.0).round() as i64,
@@ -110,8 +135,9 @@ fn main() -> Result<()> {
         for (k, (t, obs)) in group.iter().zip(observed).enumerate() {
             // in time order nothing is ever too late
             let Some(obs) = obs else { continue };
+            let row = Row::from(t);
             let clock = Instant::now();
-            let score = model.score(&Row::from(t), &obs.features);
+            let score = model.score(&row, &obs.features);
             let took = clock.elapsed();
             timings.push(nanos(took));
             if let Some(g) = graph_took.get(k) {
@@ -123,7 +149,30 @@ fn main() -> Result<()> {
             if let Some(w) = out.as_mut() {
                 writeln!(w, "{},{score}", t.tx_id)?;
             }
+            seen += 1;
+            let alert = score >= model.threshold();
+            let sampled = args.explain_every > 0 && seen.is_multiple_of(args.explain_every);
+            if let Some(w) = explained.as_mut()
+                && (alert || sampled)
+            {
+                let clock = Instant::now();
+                let phi = model
+                    .contributions(&row, &obs.features)
+                    .expect("checked above");
+                explain_timings.push(nanos(clock.elapsed()));
+                let line = serde_json::json!({
+                    "tx_id": t.tx_id,
+                    "score": score,
+                    "alert": alert,
+                    "expected": model.expected_log_odds(),
+                    "contributions": phi,
+                });
+                writeln!(w, "{line}")?;
+            }
         }
+    }
+    if let Some(mut w) = explained {
+        w.flush()?;
     }
     if let Some(mut w) = out {
         w.flush()?;
@@ -136,6 +185,9 @@ fn main() -> Result<()> {
         timings.len() as f64 / elapsed
     );
     report("model alone", &mut timings);
+    if !explain_timings.is_empty() {
+        report("explaining one payment", &mut explain_timings);
+    }
     if !whole.is_empty() {
         report("graph and model", &mut whole);
     }
