@@ -115,6 +115,7 @@ def test_one_format_keeps_the_calendar_split(sample):
     assert one.info["val_start"] == full.info["val_start"]
     assert one.info["test_start"] == full.info["test_start"]
     assert one.info["test"]["rows"] == one.test.stop - one.test.start
+    assert one.info["test"]["laundering"] == int(one.y[one.test].sum())
     assert set(one.tx_ids) <= set(full.tx_ids)
 
 

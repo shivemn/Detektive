@@ -125,9 +125,12 @@ def build(
         info["dropped"] = list(drop)
     if only_format is not None:
         info["only_format"] = only_format
+        # the counts are of the kept payments, not of the whole file
         y_all = df["is_laundering"].to_numpy()
         for part, s in (("train", slice(0, a)), ("val", slice(a, b)), ("test", slice(b, n))):
-            info[part] = {**info.get(part, {}), "rows": s.stop - s.start, "positives": int(y_all[s].sum())}
+            rows, laundering = s.stop - s.start, int(y_all[s].sum())
+            info[part] = {"rows": rows, "share": rows / n, "laundering": laundering,
+                          "laundering_rate": laundering / max(rows, 1)}
     y = df["is_laundering"].to_numpy().astype(np.int8)
     return Matrix(X, y, names, slice(0, a), slice(a, b), slice(b, n), tail, info, categories,
                   df["tx_id"].to_numpy())
