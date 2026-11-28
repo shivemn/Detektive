@@ -96,14 +96,18 @@ impl TensorProto {
         Ok(match self.data_type {
             FLOAT if !self.raw_data.is_empty() => self
                 .raw_data
-                .chunks_exact(4)
-                .map(|b| f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&b| f64::from(f32::from_le_bytes(b)))
                 .collect(),
             FLOAT => self.float_data.iter().map(|&v| f64::from(v)).collect(),
             DOUBLE if !self.raw_data.is_empty() => self
                 .raw_data
-                .chunks_exact(8)
-                .map(|b| f64::from_le_bytes(b.try_into().expect("8 bytes")))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&b| f64::from_le_bytes(b))
                 .collect(),
             DOUBLE => self.double_data.clone(),
             other => bail!("tensor of data type {other} where numbers were expected"),

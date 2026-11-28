@@ -200,9 +200,9 @@ impl Forest {
         // at a time leaves the core mostly idle. Walking several trees
         // together keeps that many loads in flight.
         const LANES: usize = 8;
-        let mut chunks = self.roots.chunks_exact(LANES);
-        for chunk in &mut chunks {
-            let mut at: [i32; LANES] = chunk.try_into().expect("chunk of LANES");
+        let (chunks, rest) = self.roots.as_chunks::<LANES>();
+        for &chunk in chunks {
+            let mut at = chunk;
             while at.iter().any(|&i| i >= 0) {
                 for i in &mut at {
                     if *i >= 0 {
@@ -215,7 +215,7 @@ impl Forest {
                 sum += self.leaves[!i as usize];
             }
         }
-        for &root in chunks.remainder() {
+        for &root in rest {
             sum += self.leaves[!self.walk(root, x) as usize];
         }
         sum
