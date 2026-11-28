@@ -137,6 +137,96 @@ The run fits in about 6 GB:
 An earlier attempt that copied each split separately was killed for running
 out of memory on the 7 GB cloud VM.
 
+## Without the payment method
+
+Week 12's explanations showed the model leaning hardest on one fact: the payment
+was made by ACH. On HI-Small that is a strong clue, because ACH has 48 times the
+laundering rate of the other methods, and 87% of the test period's laundering
+(999 of 1,143 payments) is ACH. That comes from how IBM generated the data,
+not from how laundering works. So the real question for this project is what
+the graph features are worth when the method gives nothing away. Two
+experiments answer it, under the same protocol as everything above:
+
+```bash
+# the payment method left out
+python -m detektive_ml.models.graph_boost data/processed/hi_small.parquet graph.csv \
+    --models lgbm --features both row --drop payment_format --scores
+# ACH payments only: train, validate and test on them alone
+python -m detektive_ml.models.graph_boost data/processed/hi_small.parquet graph.csv \
+    --models lgbm --features both row graph --only-format ACH
+```
+
+`--only-format` keeps the calendar split of the whole file, so the periods are
+the same days as in every other result.
+
+**All payments, the payment method left out** (LightGBM, seeds 0, 1 and 2, in
+percent):
+
+| Features | F1 | PR-AUC | F1 incl. tail | PR-AUC incl. tail |
+| --- | --- | --- | --- | --- |
+| Row + graph, with the method (week 10) | 42.79 ± 0.73 | 39.90 ± 0.53 | 58.61 ± 0.59 | 59.39 ± 0.50 |
+| Single row, without the method | 3.92 ± 0.23 | 0.93 ± 0.01 | 7.16 ± 0.12 | 2.55 ± 0.04 |
+| Graph only (never had the method, week 10) | 6.97 ± 0.16 | 10.94 ± 0.13 | 11.35 ± 0.25 | 15.41 ± 0.12 |
+| **Row + graph, without the method** | **31.59 ± 0.62** | **28.66 ± 0.12** | **49.98 ± 0.50** | **49.93 ± 0.20** |
+
+**ACH payments only** (138,141 test payments, 999 of them laundering, a rate of
+0.72%; a model guessing at random would have a PR-AUC of about 0.7):
+
+| Features | F1 | PR-AUC | F1 incl. tail | PR-AUC incl. tail |
+| --- | --- | --- | --- | --- |
+| Single row | 15.38 ± 0.10 | 8.28 ± 0.13 | 26.76 ± 0.24 | 19.14 ± 0.10 |
+| Graph only | 30.95 ± 0.50 | 32.03 ± 0.29 | 41.82 ± 0.49 | 43.27 ± 0.31 |
+| **Row + graph** | **46.68 ± 0.44** | **45.00 ± 0.57** | **61.73 ± 0.47** | **64.23 ± 0.50** |
+
+What this says:
+
+- **The method was worth about 11 F1 points, not the whole model.** Without
+  it, F1 falls from 42.8 to 31.6 and PR-AUC from 39.9 to 28.7. That is a real
+  loss, but most of the model stands.
+- **What stands is the graph features.** Without the method, single-row
+  features are close to useless: a PR-AUC of 0.9, against 0.11 for random
+  guessing. Adding the graph features takes F1 from 3.9 to 31.6.
+- **Inside ACH, where the method can tell the model nothing, the same holds.**
+  The graph features alone beat the single-row features (PR-AUC 32 against
+  8), and together they reach 45. So the rings, scatter-gathers, fan-ins and
+  first payments to a new payee separate laundering from ordinary ACH
+  payments. IBM's ACH quirk does not explain them away.
+- **Neither half works alone; together they do.** Row features without the
+  method (3.9) and graph features alone (7.0) both look weak. Combined they
+  reach 31.6. Amount, currency and time of day matter once the structure
+  around a payment is known, and not before. Week 10 found the same thing
+  with the method included.
+
+**At a review budget**, the model without the method still beats the
+hand-written rules from week 11 by a wide margin. Seed 0, test period without
+the tail:
+
+| Alerts a day | Precision, without the method | Recall | Precision, with the method | Recall | Precision, rules | Recall |
+| --- | --- | --- | --- | --- | --- | --- |
+| 25 | 91% | 5.9% | 96% | 6.3% | 49% | 3.2% |
+| 100 | 62% | 16.3% | 78% | 20.5% | 22% | 5.8% |
+| 1,000 | 16% | 42.0% | 20% | 53.2% | 3% | 7.1% |
+
+**What it leans on instead.** These are the 337 test alerts of the seed-0
+model without the method, explained with LightGBM's `pred_contrib`:
+
+- A first payment to a new payee (`pair_count`) is the largest reason for 262
+  of them.
+- Next come the receiver being in a ring found earlier (`dst_cycles`, 45) and
+  a scatter-gather (22).
+- A graph feature is the largest reason for 330 of the 337 alerts.
+- The weekday is the second reason for 160. That is worth watching. HI-Small's
+  weekends have twice the weekday laundering rate, which may be another trait
+  of the generator rather than of laundering.
+- As with the method included, alerts with a ring or scatter-gather among
+  their top five reasons are laundering more often: 83% against 66%.
+
+A model trained without the method is what a bank would want to start from,
+because its signal would carry over to data where laundering does not favour
+one method. It is not yet the model the stream runs, which keeps the method;
+week 11's scorer checks that a model's features match its own exactly. The
+GNN weeks should be compared with both models, and with this one above all.
+
 ## What came next
 
 Week 11 exports the seed-0 LightGBM model to ONNX and scores it in the stream,

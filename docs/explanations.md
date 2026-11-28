@@ -116,9 +116,13 @@ refine it. That makes the explanations useful twice:
 - for this project, the graph features need to earn their place on data where
   the payment method gives nothing away.
 
-Two ways to test that are open. One is to train without the payment method
-and see what is left. The other is the GNN work in weeks 13–16, which learns
-structure directly.
+Training without the payment method tested this directly. F1 falls from 42.8
+to 31.6. Without the method, single-row features are near useless (3.9), so
+nearly all of what is left comes from the graph features. Among ACH payments
+alone, the graph features lift PR-AUC from 8 to 45. They do separate
+laundering on their own; see [models.md](models.md#without-the-payment-method).
+The GNN work in weeks 13–16 is the next test, since it learns structure
+directly.
 
 ## Running it
 

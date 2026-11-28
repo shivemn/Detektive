@@ -42,6 +42,7 @@ HI-Small, test set, mean ± std over 3 seeds, in percent.
 | XGBoost on single-row features (floor) | 12.38 ± 0.49 | 5.16 ± 0.22 | 23.07 ± 0.33 | 11.53 ± 0.38 |
 | XGBoost on row + graph features | 41.80 ± 0.99 | 38.68 ± 0.82 | 57.38 ± 0.80 | 58.17 ± 0.83 |
 | LightGBM on row + graph features | **42.79 ± 0.73** | **39.90 ± 0.53** | **58.61 ± 0.59** | **59.39 ± 0.50** |
+| LightGBM on row + graph features, payment method left out | 31.59 ± 0.62 | 28.66 ± 0.12 | 49.98 ± 0.50 | 49.93 ± 0.20 |
 
 The main columns leave out the near-empty last days of the data, which are
 mostly laundering and easy to catch; including them nearly doubles every
@@ -161,6 +162,13 @@ laundering rate of the other methods. The rings and scatter-gathers are among
 the top five reasons for only 1 alert in 5, but those alerts are laundering
 86% of the time, against 64% for the rest. What that means for the
 project: [docs/explanations.md](docs/explanations.md).
+
+The model was then trained with the payment method left out. F1 falls from
+42.8 to 31.6, but without the method single-row features score only 3.9, so
+nearly all of what is left comes from the graph features. On ACH payments
+alone, where the method can give nothing away, the graph features lift PR-AUC
+from 8 to 45. They hold up without IBM's ACH quirk:
+[docs/models.md](docs/models.md#without-the-payment-method).
 
 ## Running it
 
