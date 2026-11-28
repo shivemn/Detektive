@@ -152,10 +152,10 @@ pub fn describe(index: usize, row: &Row, graph: &Features, window: &str) -> Stri
         24 => match (g.cycles, g.ring_repeats) {
             (0, _) => "closes no ring of payments".to_owned(),
             (_, 0) => format!("the first time these accounts closed a ring in the last {window}"),
-            (_, n) => format!(
-                "these accounts already closed this ring {} in the last {window}",
-                plural(n, "time", "times")
-            ),
+            (_, 1) => format!("these accounts already closed this ring once in the last {window}"),
+            (_, n) => {
+                format!("these accounts already closed this ring {n} times in the last {window}")
+            }
         },
         25 => match (g.cycles, g.ring_one_format) {
             (0, _) => "closes no ring of payments".to_owned(),
@@ -260,6 +260,14 @@ mod tests {
         assert_eq!(
             describe(4, &r, &g, "4 days"),
             "sender and receiver use different banks"
+        );
+        let again = Features {
+            ring_repeats: 1,
+            ..g
+        };
+        assert_eq!(
+            describe(24, &r, &again, "4 days"),
+            "these accounts already closed this ring once in the last 4 days"
         );
     }
 }
