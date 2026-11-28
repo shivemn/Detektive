@@ -52,3 +52,23 @@ def test_check_scores_joins_by_tx_id_and_spares_the_threshold():
     assert r["missing"] == 1
     moved = b.with_columns(pl.when(pl.col("tx_id") == 3).then(0.2).otherwise(pl.col("score")).alias("score"))
     assert check(a, moved, threshold=0.5, margin=1e-6)["alert_flips"] == 1
+
+
+def test_node_cover_follows_the_onnx_trees():
+    from detektive_ml.models.export import _ensemble, node_cover
+
+    booster, X = booster_and_data(2)
+    model = to_onnx(booster, X.shape[1])
+    cover = node_cover(model, booster)
+    attr = _ensemble(model)
+    trees, ids = list(attr["nodes_treeids"].ints), list(attr["nodes_nodeids"].ints)
+    modes = [m.decode() for m in attr["nodes_modes"].strings]
+    yes, no = list(attr["nodes_truenodeids"].ints), list(attr["nodes_falsenodeids"].ints)
+    at = {(t, i): k for k, (t, i) in enumerate(zip(trees, ids))}
+    assert len(cover) == len(trees) and all(c > 0 for c in cover)
+    # every split's rows go down one branch or the other
+    for k, mode in enumerate(modes):
+        if mode != "LEAF":
+            assert cover[k] == cover[at[(trees[k], yes[k])]] + cover[at[(trees[k], no[k])]]
+    # and each tree's root saw every row LightGBM trained it on
+    assert max(cover) == len(X)
